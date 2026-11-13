@@ -1,0 +1,5 @@
+{
+  "asset": "morph_missing_accessor.glb",
+  "expectLoadFailure": true,
+  "tolerance": 0.0001
+}

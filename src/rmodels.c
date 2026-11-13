@@ -143,6 +143,9 @@
 #ifndef MAX_FILEPATH_LENGTH
     #define MAX_FILEPATH_LENGTH   4096      // Maximum length for filepaths (Linux PATH_MAX default value)
 #endif
+#ifndef GLTF_FRAMERATE
+    #define GLTF_FRAMERATE        60.0f     // glTF animation framerate (frames per second)
+#endif
 
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
@@ -168,6 +171,11 @@ static ModelAnimation *LoadModelAnimationsIQM(const char *fileName, int *animCou
 static Model LoadGLTF(const char *fileName);    // Load GLTF mesh data
 static ModelAnimation *LoadModelAnimationsGLTF(const char *fileName, int *animCount);  // Load GLTF animation data
 #endif
+#if SUPPORT_FILEFORMAT_GLTF
+static bool GetMorphWeightsAtTimeGLTF(const MeshMorphChannel *channel, float time, float *weightsOut); // Sample a morph weight channel at a time (glTF interpolation)
+#endif
+static void ResetMeshMorphWeights(Mesh *mesh);  // Reset mesh morph weights to default values
+static void ApplyModelMorph(Model model);       // Apply current morph weights to runtime vertex data and upload it
 #if SUPPORT_FILEFORMAT_VOX
 static Model LoadVOX(const char *filename);     // Load VOX mesh data
 #endif
@@ -1307,7 +1315,9 @@ void UploadMesh(Mesh *mesh, bool dynamic)
     // NOTE: Vertex attributes must be uploaded considering default locations points and available vertex data
 
     // Enable vertex attributes: position (shader-location = 0)
-    void *vertices = (mesh->animVertices != NULL)? mesh->animVertices : mesh->vertices;
+    // NOTE: Morphed vertex data takes precedence when the mesh has morph targets
+    void *vertices = (mesh->animVertices != NULL)? mesh->animVertices :
+                     (mesh->morphVertices != NULL)? mesh->morphVertices : mesh->vertices;
     mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_POSITION] = rlLoadVertexBuffer(vertices, mesh->vertexCount*3*sizeof(float), dynamic);
     rlSetVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_POSITION, 3, RL_FLOAT, 0, 0, 0);
     rlEnableVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_POSITION);
@@ -1316,7 +1326,9 @@ void UploadMesh(Mesh *mesh, bool dynamic)
 
     if (mesh->texcoords != NULL)
     {
-        mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD] = rlLoadVertexBuffer(mesh->texcoords, mesh->vertexCount*2*sizeof(float), dynamic);
+        // NOTE: Morphed texture coordinates take precedence when available
+        void *texcoords = (mesh->morphTexcoords != NULL)? mesh->morphTexcoords : mesh->texcoords;
+        mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD] = rlLoadVertexBuffer(texcoords, mesh->vertexCount*2*sizeof(float), dynamic);
         rlSetVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD, 2, RL_FLOAT, 0, 0, 0);
         rlEnableVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD);
     }
@@ -1332,7 +1344,8 @@ void UploadMesh(Mesh *mesh, bool dynamic)
     if (mesh->normals != NULL)
     {
         // Enable vertex attributes: normals (shader-location = 2)
-        void *normals = (mesh->animNormals != NULL)? mesh->animNormals : mesh->normals;
+        void *normals = (mesh->animNormals != NULL)? mesh->animNormals :
+                        (mesh->morphNormals != NULL)? mesh->morphNormals : mesh->normals;
         mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_NORMAL] = rlLoadVertexBuffer(normals, mesh->vertexCount*3*sizeof(float), dynamic);
         rlSetVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_NORMAL, 3, RL_FLOAT, 0, 0, 0);
         rlEnableVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_NORMAL);
@@ -1365,7 +1378,8 @@ void UploadMesh(Mesh *mesh, bool dynamic)
     if (mesh->tangents != NULL)
     {
         // Enable vertex attribute: tangent (shader-location = 4)
-        mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TANGENT] = rlLoadVertexBuffer(mesh->tangents, mesh->vertexCount*4*sizeof(float), dynamic);
+        void *tangents = (mesh->morphTangents != NULL)? mesh->morphTangents : mesh->tangents;
+        mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TANGENT] = rlLoadVertexBuffer(tangents, mesh->vertexCount*4*sizeof(float), dynamic);
         rlSetVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_TANGENT, 4, RL_FLOAT, 0, 0, 0);
         rlEnableVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_TANGENT);
     }
@@ -1381,7 +1395,8 @@ void UploadMesh(Mesh *mesh, bool dynamic)
     if (mesh->texcoords2 != NULL)
     {
         // Enable vertex attribute: texcoord2 (shader-location = 5)
-        mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD2] = rlLoadVertexBuffer(mesh->texcoords2, mesh->vertexCount*2*sizeof(float), dynamic);
+        void *texcoords2 = (mesh->morphTexcoords2 != NULL)? mesh->morphTexcoords2 : mesh->texcoords2;
+        mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD2] = rlLoadVertexBuffer(texcoords2, mesh->vertexCount*2*sizeof(float), dynamic);
         rlSetVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD2, 2, RL_FLOAT, 0, 0, 0);
         rlEnableVertexAttribute(RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD2);
     }
@@ -1457,12 +1472,16 @@ void DrawMesh(Mesh mesh, Material material, Matrix transform)
 
     if ((mesh.texcoords != NULL) && (material.maps[MATERIAL_MAP_DIFFUSE].texture.id > 0)) rlEnableTexture(material.maps[MATERIAL_MAP_DIFFUSE].texture.id);
 
+    // Vertex/normals source priority: CPU skinning results, then morph results, then the base attributes
     if (mesh.animVertices != NULL) rlEnableStatePointer(GL_VERTEX_ARRAY, mesh.animVertices);
+    else if (mesh.morphVertices != NULL) rlEnableStatePointer(GL_VERTEX_ARRAY, mesh.morphVertices);
     else rlEnableStatePointer(GL_VERTEX_ARRAY, mesh.vertices);
 
-    if (mesh.texcoords) rlEnableStatePointer(GL_TEXTURE_COORD_ARRAY, mesh.texcoords);
+    if (mesh.morphTexcoords != NULL) rlEnableStatePointer(GL_TEXTURE_COORD_ARRAY, mesh.morphTexcoords);
+    else if (mesh.texcoords) rlEnableStatePointer(GL_TEXTURE_COORD_ARRAY, mesh.texcoords);
 
     if (mesh.animNormals != NULL) rlEnableStatePointer(GL_NORMAL_ARRAY, mesh.animNormals);
+    else if (mesh.morphNormals != NULL) rlEnableStatePointer(GL_NORMAL_ARRAY, mesh.morphNormals);
     else if (mesh.normals != NULL) rlEnableStatePointer(GL_NORMAL_ARRAY, mesh.normals);
 
     if (mesh.colors != NULL) rlEnableStatePointer(GL_COLOR_ARRAY, mesh.colors);
@@ -1964,6 +1983,29 @@ void UnloadMesh(Mesh mesh)
     // Unload mesh runtime CPU skinning data
     RL_FREE(mesh.animVertices);
     RL_FREE(mesh.animNormals);
+
+    // Unload mesh morph target (blend shape) data
+    if (mesh.morphTargets != NULL)
+    {
+        for (int t = 0; t < mesh.morphTargetCount; t++)
+        {
+            RL_FREE(mesh.morphTargets[t].positions);
+            RL_FREE(mesh.morphTargets[t].normals);
+            RL_FREE(mesh.morphTargets[t].tangents);
+            RL_FREE(mesh.morphTargets[t].texcoords);
+            RL_FREE(mesh.morphTargets[t].texcoords2);
+        }
+
+        RL_FREE(mesh.morphTargets);
+    }
+
+    RL_FREE(mesh.morphWeights);
+    RL_FREE(mesh.morphDefaultWeights);
+    RL_FREE(mesh.morphVertices);
+    RL_FREE(mesh.morphNormals);
+    RL_FREE(mesh.morphTangents);
+    RL_FREE(mesh.morphTexcoords);
+    RL_FREE(mesh.morphTexcoords2);
 }
 
 // Export mesh data to file
@@ -2304,6 +2346,117 @@ ModelAnimation *LoadModelAnimations(const char *fileName, int *animCount)
     return animations;
 }
 
+// Reset mesh morph weights to the default values loaded from the glTF file
+// NOTE: Does not re-apply the weights, call ApplyModelMorph() (or ResetModelMorphWeights()) for that
+static void ResetMeshMorphWeights(Mesh *mesh)
+{
+    if ((mesh == NULL) || (mesh->morphWeights == NULL) || (mesh->morphTargetCount <= 0)) return;
+
+    for (int t = 0; t < mesh->morphTargetCount; t++)
+    {
+        mesh->morphWeights[t] = (mesh->morphDefaultWeights != NULL)? mesh->morphDefaultWeights[t] : 0.0f;
+    }
+}
+
+// Apply current mesh morph weights to the runtime morph vertex arrays:
+// morphed = base + sum(weight[t] * delta[t]), for every available attribute.
+// Results are mirrored to the GPU vertex buffers when the mesh is uploaded.
+// NOTE: All runtime arrays are allocated at load time, nothing is allocated per call
+static void ApplyModelMorph(Model model)
+{
+    for (int m = 0; m < model.meshCount; m++)
+    {
+        Mesh *mesh = model.meshes + m;
+        if ((mesh->morphTargets == NULL) || (mesh->morphWeights == NULL) || (mesh->morphTargetCount <= 0)) continue;
+
+        const int v3 = mesh->vertexCount*3;
+        const int v4 = mesh->vertexCount*4;
+        const int v2 = mesh->vertexCount*2;
+
+        // Position deltas
+        if ((mesh->morphVertices != NULL) && (mesh->vertices != NULL))
+        {
+            memcpy(mesh->morphVertices, mesh->vertices, v3*sizeof(float));
+            for (int t = 0; t < mesh->morphTargetCount; t++)
+            {
+                const float w = mesh->morphWeights[t];
+                const float *delta = mesh->morphTargets[t].positions;
+                if ((delta == NULL) || (w == 0.0f)) continue;
+
+                for (int i = 0; i < v3; i++) mesh->morphVertices[i] += w*delta[i];
+            }
+        }
+
+        // Normal deltas
+        if ((mesh->morphNormals != NULL) && (mesh->normals != NULL))
+        {
+            memcpy(mesh->morphNormals, mesh->normals, v3*sizeof(float));
+            for (int t = 0; t < mesh->morphTargetCount; t++)
+            {
+                const float w = mesh->morphWeights[t];
+                const float *delta = mesh->morphTargets[t].normals;
+                if ((delta == NULL) || (w == 0.0f)) continue;
+
+                for (int i = 0; i < v3; i++) mesh->morphNormals[i] += w*delta[i];
+            }
+        }
+
+        // Tangent deltas (vec3 delta, base keeps its w handedness sign)
+        if ((mesh->morphTangents != NULL) && (mesh->tangents != NULL))
+        {
+            memcpy(mesh->morphTangents, mesh->tangents, v4*sizeof(float));
+            for (int t = 0; t < mesh->morphTargetCount; t++)
+            {
+                const float w = mesh->morphWeights[t];
+                const float *delta = mesh->morphTargets[t].tangents;
+                if ((delta == NULL) || (w == 0.0f)) continue;
+
+                for (int v = 0; v < mesh->vertexCount; v++)
+                {
+                    mesh->morphTangents[4*v]     += w*delta[3*v];
+                    mesh->morphTangents[4*v + 1] += w*delta[3*v + 1];
+                    mesh->morphTangents[4*v + 2] += w*delta[3*v + 2];
+                }
+            }
+        }
+
+        // Texcoord deltas (sets 0 and 1)
+        for (int set = 0; set < 2; set++)
+        {
+            float *morphUv = (set == 0)? mesh->morphTexcoords : mesh->morphTexcoords2;
+            float *baseUv = (set == 0)? mesh->texcoords : mesh->texcoords2;
+            if ((morphUv == NULL) || (baseUv == NULL)) continue;
+
+            memcpy(morphUv, baseUv, v2*sizeof(float));
+            for (int t = 0; t < mesh->morphTargetCount; t++)
+            {
+                const float w = mesh->morphWeights[t];
+                const float *delta = (set == 0)? mesh->morphTargets[t].texcoords : mesh->morphTargets[t].texcoords2;
+                if ((delta == NULL) || (w == 0.0f)) continue;
+
+                for (int i = 0; i < v2; i++) morphUv[i] += w*delta[i];
+            }
+        }
+
+        // On GPU backends (GL 3.3/ES2) mirror the runtime arrays to the vertex buffers.
+        // NOTE: On the software/GL1.1 backend rlUpdateVertexBuffer() is a no-op and the
+        // draw path reads the CPU pointers directly, so no allocation is triggered
+        if (mesh->vboId != NULL)
+        {
+            if (mesh->morphVertices != NULL)
+                rlUpdateVertexBuffer(mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_POSITION], mesh->morphVertices, v3*sizeof(float), 0);
+            if (mesh->morphNormals != NULL)
+                rlUpdateVertexBuffer(mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_NORMAL], mesh->morphNormals, v3*sizeof(float), 0);
+            if (mesh->morphTangents != NULL)
+                rlUpdateVertexBuffer(mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TANGENT], mesh->morphTangents, v4*sizeof(float), 0);
+            if (mesh->morphTexcoords != NULL)
+                rlUpdateVertexBuffer(mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD], mesh->morphTexcoords, v2*sizeof(float), 0);
+            if (mesh->morphTexcoords2 != NULL)
+                rlUpdateVertexBuffer(mesh->vboId[RL_DEFAULT_SHADER_ATTRIB_LOCATION_TEXCOORD2], mesh->morphTexcoords2, v2*sizeof(float), 0);
+        }
+    }
+}
+
 // Update model animation data (bone matrices) for a specific pose
 // NOTE 1: Request frame could be fractional, using a lerp interpolation between two frames
 void UpdateModelAnimationBones(Model model, ModelAnimation anim, float frame)
@@ -2365,9 +2518,27 @@ void UpdateModelAnimationBones(Model model, ModelAnimation anim, float frame)
 // NOTE 1: Request frame could be fractional, using a lerp interpolation between two frames
 // NOTE 2: Updated vertex animation data is uploaded to GPU in case of CPU skinning,
 // for GPU skinning, bone matrices are uploaded to shader on DrawModelEx()
+// NOTE 3: Morph target (blend shape) weight channels are evaluated independently of
+// bones, so morph-only and skinned+morph models are both supported
+// NOTE 4: Pipeline order matches the glTF spec: morph weights are evaluated and blended
+// first, then the morphed vertex data is fed to the skinning stage
 void UpdateModelAnimation(Model model, ModelAnimation anim, float frame)
 {
-    if ((anim.keyframeCount > 0) && (model.skeleton.bones != NULL) && (anim.keyframePoses != NULL))
+    bool hasBoneAnimation = (anim.keyframeCount > 0) && (model.skeleton.bones != NULL) && (anim.keyframePoses != NULL);
+    bool hasMorphAnimation = (anim.morphChannelCount > 0) && (anim.morphChannels != NULL);
+
+    if (!hasBoneAnimation && !hasMorphAnimation) return;
+
+    // Stage 1: morph targets, updates mesh->morphVertices/morphNormals (and VBO mirrors)
+    if (hasMorphAnimation)
+    {
+        // Morph weights are evaluated from native glTF keyframes at the requested time
+        UpdateModelMorph(model, anim, frame);
+    }
+
+    // Stage 2: bones. The CPU skinning stage reads mesh->morphVertices when present,
+    // so a single call on a skinned+morph model applies morph first and then skinning
+    if (hasBoneAnimation)
     {
         UpdateModelAnimationBones(model, anim, frame);
 
@@ -2375,6 +2546,132 @@ void UpdateModelAnimation(Model model, ModelAnimation anim, float frame)
         // NOTE: On GPU skinning not supported, use CPU skinning
         UpdateModelAnimationVertexBuffers(model);
     }
+}
+
+// Get number of morph targets (blend shapes) defined for a mesh
+int GetMeshMorphTargetCount(Mesh mesh)
+{
+    return mesh.morphTargetCount;
+}
+
+// Get morph target name, returns NULL for invalid indices or unnamed targets
+const char *GetMeshMorphTargetName(Mesh mesh, int targetIndex)
+{
+    if ((mesh.morphTargets == NULL) || (targetIndex < 0) || (targetIndex >= mesh.morphTargetCount)) return NULL;
+    if (mesh.morphTargets[targetIndex].name[0] == '\0') return NULL;
+
+    return mesh.morphTargets[targetIndex].name;
+}
+
+// Set a morph target weight at runtime
+// NOTE: Non-finite weights (NaN/infinity) are rejected with a warning, the stored value is left untouched
+void SetMeshMorphWeight(Mesh *mesh, int targetIndex, float weight)
+{
+    if ((mesh == NULL) || (mesh->morphWeights == NULL) || (targetIndex < 0) || (targetIndex >= mesh->morphTargetCount))
+    {
+        TRACELOG(LOG_WARNING, "MORPH: Failed to set weight, invalid mesh or target index %d", targetIndex);
+        return;
+    }
+
+    if (!isfinite(weight))
+    {
+        TRACELOG(LOG_WARNING, "MORPH: Rejected non-finite weight for target %d (%.6g)", targetIndex, weight);
+        return;
+    }
+
+    mesh->morphWeights[targetIndex] = weight;
+}
+
+// Get a morph target weight, returns 0.0f for invalid indices
+float GetMeshMorphWeight(Mesh mesh, int targetIndex)
+{
+    if ((mesh.morphWeights == NULL) || (targetIndex < 0) || (targetIndex >= mesh.morphTargetCount)) return 0.0f;
+
+    return mesh.morphWeights[targetIndex];
+}
+
+// Evaluate morph weight channels of an animation at the given frame and apply them
+// NOTE: frame uses the same frame units as UpdateModelAnimation() (60 frames per second),
+// the conversion to glTF time in seconds is done internally.
+// When the animation has no morph channels, the currently stored weights (e.g. set
+// manually through SetMeshMorphWeight()) are applied unchanged.
+void UpdateModelMorph(Model model, ModelAnimation anim, float frame)
+{
+    // No morph channels: just re-apply the current weights, this also covers
+    // manual weight editing through SetMeshMorphWeight()
+    if ((anim.morphChannelCount <= 0) || (anim.morphChannels == NULL))
+    {
+        ApplyModelMorph(model);
+        return;
+    }
+
+    // Animation switches must not keep weights from the previous animation:
+    // every mesh starts from its default weights, channels then override their targets
+    for (int m = 0; m < model.meshCount; m++) ResetMeshMorphWeights(model.meshes + m);
+
+    const float time = frame/GLTF_FRAMERATE;
+
+    // Fixed-size scratch space covers MAX_MESH_MORPH_TARGETS without per-frame allocation
+    float weightsScratch[MAX_MESH_MORPH_TARGETS] = { 0 };
+
+    for (int c = 0; c < anim.morphChannelCount; c++)
+    {
+        const MeshMorphChannel *channel = anim.morphChannels + c;
+        if ((channel->meshId < 0) || (channel->meshId >= model.meshCount)) continue;
+
+        // A glTF node weights channel drives every primitive (raylib mesh) of that node.
+        // meshCount is 1 for the common single-primitive case
+        int channelMeshCount = (channel->meshCount > 0)? channel->meshCount : 1;
+        if (channel->meshId + channelMeshCount > model.meshCount)
+            channelMeshCount = model.meshCount - channel->meshId;
+
+        int count = channel->targetCount;
+        if (count > MAX_MESH_MORPH_TARGETS)
+        {
+            TRACELOG(LOG_WARNING, "MORPH: Channel target count %d exceeds MAX_MESH_MORPH_TARGETS (%d), extra targets ignored", count, MAX_MESH_MORPH_TARGETS);
+            count = MAX_MESH_MORPH_TARGETS;
+        }
+
+        for (int t = 0; t < count; t++) weightsScratch[t] = 0.0f;
+
+        if (!GetMorphWeightsAtTimeGLTF(channel, time, weightsScratch))
+        {
+            TRACELOG(LOG_WARNING, "MORPH: Failed to evaluate morph channel %d of animation '%s'", c, anim.name);
+            continue;
+        }
+
+        for (int t = 0; t < count; t++)
+        {
+            float w = weightsScratch[t];
+            if (!isfinite(w))
+            {
+                TRACELOG(LOG_WARNING, "MORPH: Non-finite weight on channel %d target %d, clamped to 0", c, t);
+                w = 0.0f;
+            }
+
+            weightsScratch[t] = w;
+        }
+
+        // Apply the same evaluated weights to every mesh covered by the node
+        for (int mi = 0; mi < channelMeshCount; mi++)
+        {
+            Mesh *mesh = model.meshes + channel->meshId + mi;
+            if ((mesh->morphWeights == NULL) || (mesh->morphTargetCount <= 0)) continue;
+
+            int meshCount = (count < mesh->morphTargetCount)? count : mesh->morphTargetCount;
+            for (int t = 0; t < meshCount; t++) mesh->morphWeights[t] = weightsScratch[t];
+        }
+    }
+
+    ApplyModelMorph(model);
+}
+
+// Reset all morph weights of a model to their default values and reapply them
+void ResetModelMorphWeights(Model model)
+{
+    for (int m = 0; m < model.meshCount; m++) ResetMeshMorphWeights(model.meshes + m);
+
+    ApplyModelMorph(model);
 }
 
 // Update model animation data (bone matrices) for a specific pose,
@@ -2493,11 +2790,74 @@ void UpdateModelAnimationBonesEx(Model model, ModelAnimation animA, float frameA
 // for GPU skinning, bone matrices are uploaded to shader on DrawModelEx()
 void UpdateModelAnimationEx(Model model, ModelAnimation animA, float frameA, ModelAnimation animB, float frameB, float blend)
 {
-    if (model.boneMatrices == NULL) return;
+    bool hasBoneBlend = (model.boneMatrices != NULL) &&
+                        (animA.keyframeCount > 0) && (animA.keyframePoses != NULL) &&
+                        (animB.keyframeCount > 0) && (animB.keyframePoses != NULL);
+    bool hasMorphBlend = (animA.morphChannelCount > 0) && (animA.morphChannels != NULL) &&
+                         (animB.morphChannelCount > 0) && (animB.morphChannels != NULL);
 
-    if ((animA.keyframeCount > 0) && (animA.keyframePoses != NULL) &&
-        (animB.keyframeCount > 0) && (animB.keyframePoses != NULL) &&
-        (blend >= 0.0f) && (blend <= 1.0f))
+    if ((blend < 0.0f) || (blend > 1.0f) || (!hasBoneBlend && !hasMorphBlend)) return;
+
+    // Stage 1: morph blending first, so the skinning stage consumes the morphed vertices
+    if (hasMorphBlend)
+    {
+        // Evaluate both animations at their frames and blend the morph weights.
+        // Scratch arrays are fixed-size stack storage, no per-frame allocation.
+        float weightsA[MAX_MESH_MORPH_TARGETS] = { 0 };
+        float weightsB[MAX_MESH_MORPH_TARGETS] = { 0 };
+        const float timeA = frameA/GLTF_FRAMERATE;
+        const float timeB = frameB/GLTF_FRAMERATE;
+
+        for (int m = 0; m < model.meshCount; m++) ResetMeshMorphWeights(model.meshes + m);
+
+        // Match channels between the two animations by the mesh they target,
+        // rather than array index, since channel ordering can differ per animation
+        for (int ca = 0; ca < animA.morphChannelCount; ca++)
+        {
+            const MeshMorphChannel *channelA = animA.morphChannels + ca;
+            if ((channelA->meshId < 0) || (channelA->meshId >= model.meshCount)) continue;
+
+            const MeshMorphChannel *channelB = NULL;
+            for (int cb = 0; cb < animB.morphChannelCount; cb++)
+            {
+                if (animB.morphChannels[cb].meshId == channelA->meshId) { channelB = animB.morphChannels + cb; break; }
+            }
+
+            if (channelB == NULL) continue;
+            if (channelA->targetCount != channelB->targetCount) continue;
+
+            int count = channelA->targetCount;
+            if (count > MAX_MESH_MORPH_TARGETS) count = MAX_MESH_MORPH_TARGETS;
+
+            for (int t = 0; t < count; t++) { weightsA[t] = 0.0f; weightsB[t] = 0.0f; }
+            GetMorphWeightsAtTimeGLTF(channelA, timeA, weightsA);
+            GetMorphWeightsAtTimeGLTF(channelB, timeB, weightsB);
+
+            // The node channel covers every primitive mesh of the glTF node
+            int channelMeshCount = (channelA->meshCount > 0)? channelA->meshCount : 1;
+            if (channelA->meshId + channelMeshCount > model.meshCount)
+                channelMeshCount = model.meshCount - channelA->meshId;
+
+            for (int mi = 0; mi < channelMeshCount; mi++)
+            {
+                Mesh *mesh = model.meshes + channelA->meshId + mi;
+                if (mesh->morphWeights == NULL) continue;
+
+                int meshCount = (count < mesh->morphTargetCount)? count : mesh->morphTargetCount;
+                for (int t = 0; t < meshCount; t++)
+                {
+                    float wa = isfinite(weightsA[t])? weightsA[t] : 0.0f;
+                    float wb = isfinite(weightsB[t])? weightsB[t] : 0.0f;
+                    mesh->morphWeights[t] = wa*(1.0f - blend) + wb*blend;
+                }
+            }
+        }
+
+        ApplyModelMorph(model);
+    }
+
+    // Stage 2: bone blending and CPU skinning over the (possibly morphed) vertices
+    if (hasBoneBlend)
     {
         UpdateModelAnimationBonesEx(model, animA, frameA, animB, frameB, blend);
 
@@ -2534,17 +2894,21 @@ static void UpdateModelAnimationVertexBuffers(Model model)
         Material material = model.materials[model.meshMaterial[m]];
         if ((material.shader.locs != NULL) && (material.shader.locs[SHADER_LOC_VERTEX_BONEIDS] != -1)) continue;
 #endif
-        // Lazy allocation of CPU animation buffers for vertex positions and normals, 
+        // Lazy allocation of CPU animation buffers for vertex positions and normals,
         // to be used on CPU software skinning
+        // NOTE: When morph targets are active the skinning input is the morphed vertex data,
+        // so morphing is applied before skinning, as in the glTF vertex pipeline
+        const float *basePositions = (mesh->morphVertices != NULL)? mesh->morphVertices : mesh->vertices;
+        const float *baseNormals = (mesh->morphNormals != NULL)? mesh->morphNormals : mesh->normals;
         if (mesh->animVertices == NULL)
         {
             mesh->animVertices = (float *)RL_CALLOC(mesh->vertexCount*3, sizeof(float));
-            memcpy(mesh->animVertices, mesh->vertices, mesh->vertexCount*3*sizeof(float));
+            memcpy(mesh->animVertices, basePositions, mesh->vertexCount*3*sizeof(float));
         }
         if ((mesh->normals != NULL) && (mesh->animNormals == NULL))
         {
             mesh->animNormals = (float *)RL_CALLOC(mesh->vertexCount*3, sizeof(float));
-            memcpy(mesh->animNormals, mesh->normals, mesh->vertexCount*3*sizeof(float));
+            memcpy(mesh->animNormals, baseNormals, mesh->vertexCount*3*sizeof(float));
         }
 
         // Normal matrix only depends on the bone, compute it once per bone instead of per vertex
@@ -2575,7 +2939,7 @@ static void UpdateModelAnimationVertexBuffers(Model model)
 
                 // Early stop when no transformation will be applied
                 if (boneWeight == 0.0f) continue;
-                animVertex = (Vector3){ mesh->vertices[vCounter], mesh->vertices[vCounter + 1], mesh->vertices[vCounter + 2] };
+                animVertex = (Vector3){ basePositions[vCounter], basePositions[vCounter + 1], basePositions[vCounter + 2] };
                 animVertex = Vector3Transform(animVertex, model.boneMatrices[boneIndex]);
                 mesh->animVertices[vCounter] += animVertex.x*boneWeight;
                 mesh->animVertices[vCounter + 1] += animVertex.y*boneWeight;
@@ -2586,7 +2950,7 @@ static void UpdateModelAnimationVertexBuffers(Model model)
                 // NOTE: Using meshes.baseNormals (default normal) to calculate meshes.normals (animated normals)
                 if ((mesh->normals != NULL) && (mesh->animNormals != NULL ))
                 {
-                    animNormal = (Vector3){ mesh->normals[vCounter], mesh->normals[vCounter + 1], mesh->normals[vCounter + 2] };
+                    animNormal = (Vector3){ baseNormals[vCounter], baseNormals[vCounter + 1], baseNormals[vCounter + 2] };
                     animNormal = Vector3Transform(animNormal, MatrixTranspose(MatrixInvert(model.boneMatrices[boneIndex])));
                     mesh->animNormals[vCounter] += animNormal.x*boneWeight;
                     mesh->animNormals[vCounter + 1] += animNormal.y*boneWeight;
@@ -2613,16 +2977,32 @@ void UnloadModelAnimations(ModelAnimation *animations, int animCount)
             RL_FREE(animations[a].keyframePoses[i]);
 
         RL_FREE(animations[a].keyframePoses);
+
+        // Unload morph weight channel data
+        for (int c = 0; c < animations[a].morphChannelCount; c++)
+        {
+            RL_FREE(animations[a].morphChannels[c].times);
+            RL_FREE(animations[a].morphChannels[c].values);
+        }
+
+        RL_FREE(animations[a].morphChannels);
     }
 
     RL_FREE(animations);
 }
 
 // Check model animation skeleton match
-// NOTE: Only number of bones and parent connections are checked
+// NOTE: Only number of bones and parent connections are checked.
+// Morph-only animations have no bones, they match any model as long as they carry morph channels
 bool IsModelAnimationValid(Model model, ModelAnimation anim)
 {
     int result = true;
+
+    if (anim.morphChannelCount > 0)
+    {
+        // Morph animation: bone counts are irrelevant, channels target model meshes directly
+        return true;
+    }
 
     if (model.skeleton.boneCount != anim.boneCount) result = false;
 
@@ -5484,6 +5864,66 @@ static BoneInfo *LoadBoneInfoGLTF(cgltf_skin skin, unsigned int *boneCount)
     return bones;
 }
 
+#if SUPPORT_FILEFORMAT_GLTF
+// Read a morph target accessor as float deltas into a newly allocated array.
+// Returns NULL (with a warning) when the accessor is missing, sparse or uses an unsupported type.
+// NOTE: glTF morph target accessors store deltas, component type must be FLOAT per spec
+static float *LoadMorphAccessorGLTF(cgltf_accessor *accessor, cgltf_type expectedType, int components, unsigned int vertexCount, const char *fileName, const char *targetName)
+{
+    if (accessor == NULL)
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Morph target '%s' is missing a required accessor, attribute skipped", fileName, targetName);
+        return NULL;
+    }
+
+    if (accessor->is_sparse)
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Morph target '%s' uses a sparse accessor, not supported, attribute skipped", fileName, targetName);
+        return NULL;
+    }
+
+    if ((accessor->type != expectedType) || (accessor->component_type != cgltf_component_type_r_32f) ||
+        (accessor->buffer_view == NULL) || (accessor->count != vertexCount))
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Morph target '%s' accessor format/count mismatch, attribute skipped", fileName, targetName);
+        return NULL;
+    }
+
+    float *values = (float *)RL_CALLOC((size_t)vertexCount*components, sizeof(float));
+    if (values == NULL)
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Morph target '%s' failed to allocate attribute buffer", fileName, targetName);
+        return NULL;
+    }
+
+    if (!cgltf_accessor_unpack_floats(accessor, values, (cgltf_size)vertexCount*components))
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Morph target '%s' failed to read accessor data, attribute skipped", fileName, targetName);
+        RL_FREE(values);
+        return NULL;
+    }
+
+    return values;
+}
+
+// Transform morph target position/normal/tangent deltas by the node world matrix.
+// NOTE: Deltas are vectors, not points: the translation part of the world matrix must not be applied.
+// Normals use the inverse-transpose matrix, positions and tangents use the plain 3x3 rotation-scale part.
+static void TransformMorphDeltasGLTF(float *values, unsigned int vertexCount, int components, Matrix matrix)
+{
+    if (values == NULL) return;
+
+    for (unsigned int k = 0; k < vertexCount; k++)
+    {
+        Vector3 v = { values[components*k], values[components*k + 1], values[components*k + 2] };
+        v = Vector3Transform(v, matrix);
+        values[components*k] = v.x;
+        values[components*k + 1] = v.y;
+        values[components*k + 2] = v.z;
+    }
+}
+#endif
+
 // Load glTF file into model struct, .gltf and .glb supported
 static Model LoadGLTF(const char *fileName)
 {
@@ -6209,6 +6649,121 @@ static Model LoadGLTF(const char *fileName)
                     }
                 }
 
+                // Load morph targets (blend shapes) defined by the primitive
+                // REF: https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#morph-targets
+                // NOTE: Targets store vertex deltas (not absolute positions), supported attributes
+                // are POSITION, NORMAL, TANGENT and TEXCOORD_0/TEXCOORD_1
+                cgltf_primitive *primitive = &mesh->primitives[p];
+                if (primitive->targets_count > 0)
+                {
+                    Mesh *targetMesh = model.meshes + meshIndex;
+                    unsigned int targetCount = primitive->targets_count;
+
+                    if (targetCount > MAX_MESH_MORPH_TARGETS)
+                    {
+                        TRACELOG(LOG_WARNING, "MODEL: [%s] Primitive defines %u morph targets, limit is %d, extra targets ignored", fileName, targetCount, MAX_MESH_MORPH_TARGETS);
+                        targetCount = MAX_MESH_MORPH_TARGETS;
+                    }
+
+                    targetMesh->morphTargetCount = (int)targetCount;
+                    targetMesh->morphTargets = (MeshMorphTarget *)RL_CALLOC(targetCount, sizeof(MeshMorphTarget));
+                    targetMesh->morphWeights = (float *)RL_CALLOC(targetCount, sizeof(float));
+                    targetMesh->morphDefaultWeights = (float *)RL_CALLOC(targetCount, sizeof(float));
+
+                    // Default weights: node weights override mesh weights, missing weights default to 0
+                    for (unsigned int t = 0; t < targetCount; t++)
+                    {
+                        float defaultWeight = 0.0f;
+                        if ((node->weights != NULL) && (node->weights_count > t)) defaultWeight = node->weights[t];
+                        else if ((mesh->weights != NULL) && (mesh->weights_count > t)) defaultWeight = mesh->weights[t];
+
+                        if (!isfinite(defaultWeight))
+                        {
+                            TRACELOG(LOG_WARNING, "MODEL: [%s] Non-finite default morph weight at target %u, clamped to 0", fileName, t);
+                            defaultWeight = 0.0f;
+                        }
+
+                        targetMesh->morphDefaultWeights[t] = defaultWeight;
+                        targetMesh->morphWeights[t] = defaultWeight;
+                    }
+
+                    // 3x3 rotation-scale part of the world matrix, used for position/tangent deltas
+                    Matrix deltaMatrix = worldMatrix;
+                    deltaMatrix.m12 = 0.0f; deltaMatrix.m13 = 0.0f; deltaMatrix.m14 = 0.0f;
+
+                    for (unsigned int t = 0; t < targetCount; t++)
+                    {
+                        cgltf_morph_target *target = &primitive->targets[t];
+                        MeshMorphTarget *morphTarget = &targetMesh->morphTargets[t];
+
+                        // Target name: mesh-level target_names first (glTF standard), unnamed otherwise
+                        if ((mesh->target_names != NULL) && (mesh->target_names_count > t) && (mesh->target_names[t] != NULL))
+                            snprintf(morphTarget->name, sizeof(morphTarget->name), "%s", mesh->target_names[t]);
+
+                        char targetLabel[80] = { 0 };
+                        snprintf(targetLabel, sizeof(targetLabel), "target %u (%s)", t, morphTarget->name[0] != '\0'? morphTarget->name : "unnamed");
+
+                        for (cgltf_size a = 0; a < target->attributes_count; a++)
+                        {
+                            cgltf_attribute *attribute = &target->attributes[a];
+                            cgltf_accessor *accessor = attribute->data;
+
+                            switch (attribute->type)
+                            {
+                                case cgltf_attribute_type_position:
+                                {
+                                    morphTarget->positions = LoadMorphAccessorGLTF(accessor, cgltf_type_vec3, 3, (unsigned int)targetMesh->vertexCount, fileName, targetLabel);
+                                    TransformMorphDeltasGLTF(morphTarget->positions, (unsigned int)targetMesh->vertexCount, 3, deltaMatrix);
+                                } break;
+                                case cgltf_attribute_type_normal:
+                                {
+                                    morphTarget->normals = LoadMorphAccessorGLTF(accessor, cgltf_type_vec3, 3, (unsigned int)targetMesh->vertexCount, fileName, targetLabel);
+                                    TransformMorphDeltasGLTF(morphTarget->normals, (unsigned int)targetMesh->vertexCount, 3, worldMatrixNormals);
+                                } break;
+                                case cgltf_attribute_type_tangent:
+                                {
+                                    // glTF tangent targets are vec3 (xyz delta only, base w handedness sign is kept)
+                                    morphTarget->tangents = LoadMorphAccessorGLTF(accessor, cgltf_type_vec3, 3, (unsigned int)targetMesh->vertexCount, fileName, targetLabel);
+                                    TransformMorphDeltasGLTF(morphTarget->tangents, (unsigned int)targetMesh->vertexCount, 3, deltaMatrix);
+                                } break;
+                                case cgltf_attribute_type_texcoord:
+                                {
+                                    if (attribute->index == 0)
+                                        morphTarget->texcoords = LoadMorphAccessorGLTF(accessor, cgltf_type_vec2, 2, (unsigned int)targetMesh->vertexCount, fileName, targetLabel);
+                                    else if (attribute->index == 1)
+                                        morphTarget->texcoords2 = LoadMorphAccessorGLTF(accessor, cgltf_type_vec2, 2, (unsigned int)targetMesh->vertexCount, fileName, targetLabel);
+                                    else
+                                        TRACELOG(LOG_WARNING, "MODEL: [%s] Morph target '%s' texcoord set %d not supported, skipped", fileName, targetLabel, attribute->index);
+                                } break;
+                                default:
+                                    TRACELOG(LOG_WARNING, "MODEL: [%s] Morph target '%s' uses unsupported attribute type, skipped", fileName, targetLabel);
+                                break;
+                            }
+                        }
+
+                        // A target without any readable attribute is useless: report it clearly
+                        if ((morphTarget->positions == NULL) && (morphTarget->normals == NULL) &&
+                            (morphTarget->tangents == NULL) && (morphTarget->texcoords == NULL) && (morphTarget->texcoords2 == NULL))
+                        {
+                            TRACELOG(LOG_WARNING, "MODEL: [%s] Morph target '%s' has no loadable attributes", fileName, targetLabel);
+                        }
+                    }
+
+                    // Allocate runtime morph result arrays once, at load time.
+                    // These buffers are reused by every UpdateModelMorph()/ApplyModelMorph() call,
+                    // so no per-frame allocation is required while animating.
+                    targetMesh->morphVertices = (float *)RL_CALLOC((size_t)targetMesh->vertexCount*3, sizeof(float));
+                    targetMesh->morphNormals = (targetMesh->normals != NULL)? (float *)RL_CALLOC((size_t)targetMesh->vertexCount*3, sizeof(float)) : NULL;
+                    targetMesh->morphTangents = (targetMesh->tangents != NULL)? (float *)RL_CALLOC((size_t)targetMesh->vertexCount*4, sizeof(float)) : NULL;
+                    targetMesh->morphTexcoords = (targetMesh->texcoords != NULL)? (float *)RL_CALLOC((size_t)targetMesh->vertexCount*2, sizeof(float)) : NULL;
+                    targetMesh->morphTexcoords2 = (targetMesh->texcoords2 != NULL)? (float *)RL_CALLOC((size_t)targetMesh->vertexCount*2, sizeof(float)) : NULL;
+
+                    // Initialize the runtime arrays with the base geometry weighted by the default weights
+                    ApplyModelMorph(model);
+
+                    TRACELOG(LOG_INFO, "MODEL: [%s] Loaded %u morph targets for mesh %d", fileName, targetCount, meshIndex);
+                }
+
                 meshIndex++;       // Move to next mesh
             }
         }
@@ -6603,7 +7158,120 @@ static bool GetPoseAtTimeGLTF(cgltf_interpolation_type interpolationType, cgltf_
     return true;
 }
 
-#define GLTF_FRAMERATE 60.0f    // glTF animation framerate (frames per second)
+// Sample a glTF morph weight channel (scalar output accessor) at the given time in seconds.
+// Implements the three glTF interpolation modes: LINEAR, STEP and CUBICSPLINE.
+// NOTE: Times outside the sampler range are clamped to the first/last keyframe value.
+static bool GetMorphWeightsAtTimeGLTF(const MeshMorphChannel *channel, float time, float *weightsOut)
+{
+    if ((channel == NULL) || (weightsOut == NULL) || (channel->keyframeCount <= 0) || (channel->times == NULL) || (channel->values == NULL)) return false;
+
+    const int keyCount = channel->keyframeCount;
+    const int targetCount = channel->targetCount;
+
+    // Single keyframe: evaluate directly
+    if (keyCount == 1)
+    {
+        if (channel->interpolation == MORPH_INTERPOLATION_CUBICSPLINE)
+        {
+            // Cubic layout: in-tangent, value, out-tangent; only the value is used at the sole keyframe
+            for (int t = 0; t < targetCount; t++) weightsOut[t] = channel->values[1*targetCount + t];
+        }
+        else
+        {
+            for (int t = 0; t < targetCount; t++) weightsOut[t] = channel->values[t];
+        }
+
+        return true;
+    }
+
+    // Clamp time to the sampler range and find the surrounding keyframes
+    if (time <= channel->times[0])
+    {
+        if (channel->interpolation == MORPH_INTERPOLATION_CUBICSPLINE)
+        {
+            for (int t = 0; t < targetCount; t++) weightsOut[t] = channel->values[1*targetCount + t];
+        }
+        else
+        {
+            for (int t = 0; t < targetCount; t++) weightsOut[t] = channel->values[t];
+        }
+
+        return true;
+    }
+
+    if (time >= channel->times[keyCount - 1])
+    {
+        const int last = keyCount - 1;
+        if (channel->interpolation == MORPH_INTERPOLATION_CUBICSPLINE)
+        {
+            for (int t = 0; t < targetCount; t++) weightsOut[t] = channel->values[(3*last + 1)*targetCount + t];
+        }
+        else
+        {
+            for (int t = 0; t < targetCount; t++) weightsOut[t] = channel->values[last*targetCount + t];
+        }
+
+        return true;
+    }
+
+    int keyframe = 0;
+    for (int i = 0; i < keyCount - 1; i++)
+    {
+        if ((channel->times[i] <= time) && (time < channel->times[i + 1]))
+        {
+            keyframe = i;
+            break;
+        }
+    }
+
+    const float tStart = channel->times[keyframe];
+    const float tEnd = channel->times[keyframe + 1];
+    const float duration = fmaxf(tEnd - tStart, EPSILON);
+    float u = (time - tStart)/duration;
+    u = Clamp(u, 0.0f, 1.0f);
+
+    switch (channel->interpolation)
+    {
+        case MORPH_INTERPOLATION_STEP:
+        {
+            for (int t = 0; t < targetCount; t++) weightsOut[t] = channel->values[keyframe*targetCount + t];
+        } break;
+        case MORPH_INTERPOLATION_CALCULATED:    // glTF LINEAR
+        {
+            for (int t = 0; t < targetCount; t++)
+            {
+                const float v1 = channel->values[keyframe*targetCount + t];
+                const float v2 = channel->values[(keyframe + 1)*targetCount + t];
+                weightsOut[t] = v1 + (v2 - v1)*u;
+            }
+        } break;
+        case MORPH_INTERPOLATION_CUBICSPLINE:
+        {
+            // Per-keyframe layout: [in-tangent, value, out-tangent] * targetCount
+            // Tangents are stored normalized (per second), multiply by the interval duration
+            const float *inNext = channel->values + (3*(keyframe + 1))*targetCount;
+            const float *v1Block = channel->values + (3*keyframe + 1)*targetCount;
+            const float *outCur = channel->values + (3*keyframe + 2)*targetCount;
+            const float *v2Block = channel->values + (3*(keyframe + 1) + 1)*targetCount;
+            const float u2 = u*u;
+            const float u3 = u2*u;
+            const float h00 = 2.0f*u3 - 3.0f*u2 + 1.0f;
+            const float h10 = u3 - 2.0f*u2 + u;
+            const float h01 = -2.0f*u3 + 3.0f*u2;
+            const float h11 = u3 - u2;
+
+            for (int t = 0; t < targetCount; t++)
+            {
+                const float tangent1 = outCur[t]*duration;
+                const float tangent2 = inNext[t]*duration;
+                weightsOut[t] = h00*v1Block[t] + h10*tangent1 + h01*v2Block[t] + h11*tangent2;
+            }
+        } break;
+        default: break;
+    }
+
+    return true;
+}
 
 static ModelAnimation *LoadModelAnimationsGLTF(const char *fileName, int *animCount)
 {
@@ -6632,6 +7300,65 @@ static ModelAnimation *LoadModelAnimationsGLTF(const char *fileName, int *animCo
 
     if (result == cgltf_result_success)
     {
+        if (data->animations_count == 0)
+        {
+            // Nothing to load, report zero animations
+            *animCount = 0;
+            cgltf_free(data);
+            UnloadFileData(fileData);
+            return NULL;
+        }
+
+        *animCount = (int)data->animations_count;
+        animations = (ModelAnimation *)RL_CALLOC(data->animations_count, sizeof(ModelAnimation));
+        if (animations == NULL)
+        {
+            TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to allocate animation array", fileName);
+            *animCount = 0;
+            cgltf_free(data);
+            UnloadFileData(fileData);
+            return NULL;
+        }
+
+        // Animation names are stored up-front so morph-only models (no skin) keep them too
+        for (unsigned int a = 0; a < data->animations_count; a++)
+        {
+            if (data->animations[a].name != NULL)
+                snprintf(animations[a].name, sizeof(animations[a].name), "%s", data->animations[a].name);
+        }
+
+        // Build a mapping from glTF mesh-bearing nodes to raylib mesh indices.
+        // NOTE: It mirrors the node traversal order used in LoadGLTF(), one raylib Mesh per
+        // triangle primitive. A node's primitives occupy a consecutive mesh index range,
+        // so store the first index and the number of meshes (glTF node weights apply to all primitives)
+        int *nodeToMeshId = (int *)RL_CALLOC(data->nodes_count, sizeof(int));
+        int *nodeToMeshCount = (int *)RL_CALLOC(data->nodes_count, sizeof(int));
+        for (unsigned int n = 0; n < data->nodes_count; n++) { nodeToMeshId[n] = -1; nodeToMeshCount[n] = 0; }
+
+        int nodeMeshIndex = 0;
+        for (unsigned int n = 0; n < data->nodes_count; n++)
+        {
+            cgltf_node *node = &(data->nodes[n]);
+            if (node->mesh == NULL) continue;
+
+            int nodeFirstMesh = nodeMeshIndex;
+            int nodeMeshTotal = 0;
+            for (unsigned int p = 0; p < node->mesh->primitives_count; p++)
+            {
+                if (node->mesh->primitives[p].type == cgltf_primitive_type_triangles)
+                {
+                    nodeMeshIndex++;
+                    nodeMeshTotal++;
+                }
+            }
+
+            if (nodeMeshTotal > 0)
+            {
+                nodeToMeshId[n] = nodeFirstMesh;
+                nodeToMeshCount[n] = nodeMeshTotal;
+            }
+        }
+
         if (data->skins_count > 0)
         {
             cgltf_skin skin = data->skins[0];
@@ -6649,14 +7376,14 @@ static ModelAnimation *LoadModelAnimationsGLTF(const char *fileName, int *animCo
                 // Allocation failed: abort animation loading at the source rather than
                 // propagating a NULL pointer into the per-frame transform loop below
                 TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to allocate joint offset buffer", fileName);
+                RL_FREE(nodeToMeshId);
+                RL_FREE(nodeToMeshCount);
+                RL_FREE(animations);
                 cgltf_free(data);
                 UnloadFileData(fileData);
                 *animCount = 0;
                 return NULL;
             }
-
-            *animCount = (int)data->animations_count;
-            animations = (ModelAnimation *)RL_CALLOC(data->animations_count, sizeof(ModelAnimation));
 
             for (int k = 0; k < jointCount; k++)
             {
@@ -6741,8 +7468,13 @@ static ModelAnimation *LoadModelAnimationsGLTF(const char *fileName, int *animCo
 
                 if (animData.name != NULL) snprintf(animations[a].name, sizeof(animations[a].name), "%s", animData.name);
 
-                animations[a].keyframeCount = (int)(animDuration*GLTF_FRAMERATE) + 1;
-                animations[a].keyframePoses = (Transform **)RL_CALLOC(animations[a].keyframeCount, sizeof(Transform *));
+                // Animations without any bone channel (morph-only) have zero duration here:
+                // don't bake keyframe poses for them, their data lives in the morph channels
+                if (animDuration > 0.0f)
+                {
+                    animations[a].keyframeCount = (int)(animDuration*GLTF_FRAMERATE) + 1;
+                    animations[a].keyframePoses = (Transform **)RL_CALLOC(animations[a].keyframeCount, sizeof(Transform *));
+                }
 
                 for (int j = 0; j < animations[a].keyframeCount; j++)
                 {
@@ -6803,6 +7535,176 @@ static ModelAnimation *LoadModelAnimationsGLTF(const char *fileName, int *animCo
 
             RL_FREE(extOffset);
         }
+
+        // Load morph target (blend shape) weight channels, glTF target path "weights".
+        // NOTE: Independent of skins, so morph-only models (no armature) are supported too
+        for (unsigned int a = 0; a < data->animations_count; a++)
+        {
+            cgltf_animation animData = data->animations[a];
+
+            // First pass: count weight channels targeting known mesh nodes
+            int morphChannelCount = 0;
+            for (cgltf_size j = 0; j < animData.channels_count; j++)
+            {
+                cgltf_animation_channel *channel = &animData.channels[j];
+                if (channel->target_path != cgltf_animation_path_type_weights) continue;
+                if (channel->target_node == NULL) continue;
+
+                int nodeIndex = (int)(channel->target_node - data->nodes);
+                if ((nodeIndex < 0) || (nodeIndex >= (int)data->nodes_count) || (nodeToMeshId[nodeIndex] < 0))
+                {
+                    TRACELOG(LOG_WARNING, "MODEL: [%s] Morph weight channel %u targets a node without a mesh, skipped", fileName, (unsigned int)j);
+                    continue;
+                }
+
+                morphChannelCount++;
+            }
+
+            if (morphChannelCount == 0) continue;
+
+            animations[a].morphChannelCount = morphChannelCount;
+            animations[a].morphChannels = (MeshMorphChannel *)RL_CALLOC(morphChannelCount, sizeof(MeshMorphChannel));
+
+            int channelOut = 0;
+            for (cgltf_size j = 0; j < animData.channels_count; j++)
+            {
+                cgltf_animation_channel *channel = &animData.channels[j];
+                if (channel->target_path != cgltf_animation_path_type_weights) continue;
+                if (channel->target_node == NULL) continue;
+
+                int nodeIndex = (int)(channel->target_node - data->nodes);
+                if ((nodeIndex < 0) || (nodeIndex >= (int)data->nodes_count) || (nodeToMeshId[nodeIndex] < 0)) continue;
+
+                cgltf_animation_sampler *sampler = channel->sampler;
+                if ((sampler == NULL) || (sampler->input == NULL) || (sampler->output == NULL))
+                {
+                    TRACELOG(LOG_WARNING, "MODEL: [%s] Morph weight channel %u is missing sampler/accessor data, skipped", fileName, (unsigned int)j);
+                    continue;
+                }
+
+                if (sampler->input->is_sparse || sampler->output->is_sparse)
+                {
+                    TRACELOG(LOG_WARNING, "MODEL: [%s] Morph weight channel %u uses sparse accessors, not supported, skipped", fileName, (unsigned int)j);
+                    continue;
+                }
+
+                if (sampler->output->component_type != cgltf_component_type_r_32f)
+                {
+                    TRACELOG(LOG_WARNING, "MODEL: [%s] Morph weight channel %u output must be scalar float, skipped", fileName, (unsigned int)j);
+                    continue;
+                }
+
+                cgltf_mesh *targetMeshCgltf = channel->target_node->mesh;
+                int targetCount = (int)targetMeshCgltf->primitives[0].targets_count;
+                if (targetCount <= 0)
+                {
+                    TRACELOG(LOG_WARNING, "MODEL: [%s] Morph weight channel %u targets a mesh without morph targets, skipped", fileName, (unsigned int)j);
+                    continue;
+                }
+
+                if (targetCount > MAX_MESH_MORPH_TARGETS)
+                {
+                    TRACELOG(LOG_WARNING, "MODEL: [%s] Morph channel target count %d exceeds MAX_MESH_MORPH_TARGETS (%d), extra targets ignored", fileName, targetCount, MAX_MESH_MORPH_TARGETS);
+                    targetCount = MAX_MESH_MORPH_TARGETS;
+                }
+
+                MeshMorphChannel *out = &animations[a].morphChannels[channelOut];
+                out->meshId = nodeToMeshId[nodeIndex];
+                out->meshCount = nodeToMeshCount[nodeIndex];
+                out->targetCount = targetCount;
+                out->keyframeCount = (int)sampler->input->count;
+
+                switch (sampler->interpolation)
+                {
+                    case cgltf_interpolation_type_step: out->interpolation = MORPH_INTERPOLATION_STEP; break;
+                    case cgltf_interpolation_type_cubic_spline: out->interpolation = MORPH_INTERPOLATION_CUBICSPLINE; break;
+                    case cgltf_interpolation_type_linear:
+                    default: out->interpolation = MORPH_INTERPOLATION_CALCULATED; break;
+                }
+
+                // Copy native keyframe times (seconds), keeping full sampler precision
+                out->times = (float *)RL_CALLOC(out->keyframeCount, sizeof(float));
+                for (int k = 0; k < out->keyframeCount; k++)
+                {
+                    float t = 0.0f;
+                    if (!cgltf_accessor_read_float(sampler->input, k, &t, 1))
+                    {
+                        TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to read morph keyframe time %d, channel skipped", fileName, k);
+                        RL_FREE(out->times);
+                        out->times = NULL;
+                        break;
+                    }
+
+                    out->times[k] = t;
+                }
+
+                if (out->times == NULL) continue;
+
+                // Copy weights: linear/step store one scalar set per keyframe,
+                // cubic spline stores in-tangent/value/out-tangent (3 sets) per keyframe
+                int setsPerKeyframe = (out->interpolation == MORPH_INTERPOLATION_CUBICSPLINE)? 3 : 1;
+                int valueCount = out->keyframeCount*setsPerKeyframe*targetCount;
+                out->values = (float *)RL_CALLOC(valueCount, sizeof(float));
+
+                bool valuesOk = true;
+                for (int k = 0; (k < out->keyframeCount) && valuesOk; k++)
+                {
+                    for (int s = 0; s < setsPerKeyframe; s++)
+                    {
+                        for (int t = 0; t < targetCount; t++)
+                        {
+                            // glTF weight samplers use SCALAR output accessors, one float element
+                            // per (keyframe, cubic set, target) combination, so read element by element
+                            cgltf_size scalarIndex = (cgltf_size)((k*setsPerKeyframe + s)*targetCount + t);
+                            float w = 0.0f;
+                            if (!cgltf_accessor_read_float(sampler->output, scalarIndex, &w, 1))
+                            {
+                                TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to read morph weights at keyframe %d target %d, channel skipped", fileName, k, t);
+                                valuesOk = false;
+                                break;
+                            }
+
+                            if (!isfinite(w))
+                            {
+                                TRACELOG(LOG_WARNING, "MODEL: [%s] Non-finite morph weight at keyframe %d target %d, clamped to 0", fileName, k, t);
+                                w = 0.0f;
+                            }
+
+                            out->values[(k*setsPerKeyframe + s)*targetCount + t] = w;
+                        }
+                    }
+                }
+
+                if (!valuesOk)
+                {
+                    RL_FREE(out->times);
+                    RL_FREE(out->values);
+                    out->times = NULL;
+                    out->values = NULL;
+                    continue;
+                }
+
+                TRACELOG(LOG_INFO, "MODEL: [%s] Loaded morph channel for mesh %d | Targets: %d | Keyframes: %d | Interpolation: %d",
+                         fileName, out->meshId, out->targetCount, out->keyframeCount, (int)out->interpolation);
+                channelOut++;
+            }
+
+            // If every candidate channel failed to load, release the empty array again
+            if (channelOut == 0)
+            {
+                RL_FREE(animations[a].morphChannels);
+                animations[a].morphChannels = NULL;
+                animations[a].morphChannelCount = 0;
+            }
+            else if (channelOut < morphChannelCount)
+            {
+                // Shrink is not required: unused trailing entries stay zeroed and are iterated by count
+                animations[a].morphChannelCount = channelOut;
+            }
+        }
+
+        RL_FREE(nodeToMeshId);
+        RL_FREE(nodeToMeshCount);
 
         if (data->skins_count > 1)
         {

@@ -1,0 +1,6 @@
+{
+  "asset": "morph_over_limit.glb",
+  "definedTargets": 34,
+  "expectedLoadedTargets": 32,
+  "tolerance": 0.0001
+}

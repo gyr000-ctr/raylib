@@ -1,0 +1,73 @@
+{
+  "asset": "morph_combined.glb",
+  "defaultWeights": [
+    0.0
+  ],
+  "samples": [
+    {
+      "boneTranslationY": 0.0,
+      "frame": 0,
+      "morphWeight": 0.0,
+      "positions": [
+        -1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        -1.0,
+        1.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0
+      ],
+      "time": 0.0
+    },
+    {
+      "boneTranslationY": 1.0,
+      "frame": 30,
+      "morphWeight": 0.5,
+      "positions": [
+        -1.0,
+        1.5,
+        0.0,
+        1.0,
+        1.5,
+        0.0,
+        -1.0,
+        2.5,
+        0.0,
+        1.0,
+        2.5,
+        0.0
+      ],
+      "time": 0.5
+    },
+    {
+      "boneTranslationY": 2.0,
+      "frame": 60,
+      "morphWeight": 1.0,
+      "positions": [
+        -1.0,
+        3.0,
+        0.0,
+        1.0,
+        3.0,
+        0.0,
+        -1.0,
+        4.0,
+        0.0,
+        1.0,
+        4.0,
+        0.0
+      ],
+      "time": 1.0
+    }
+  ],
+  "singleAnimationWithBoneAndMorph": true,
+  "targetNames": [
+    "combined_morph"
+  ],
+  "tolerance": 0.0001
+}

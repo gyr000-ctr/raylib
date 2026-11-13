@@ -1,0 +1,35 @@
+{
+  "asset": "morph_multi_primitive.glb",
+  "expectedMeshCount": 2,
+  "frame": 60,
+  "mesh0Positions": [
+    -1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    -1.0,
+    2.0,
+    0.0,
+    1.0,
+    2.0,
+    0.0
+  ],
+  "mesh1Positions": [
+    -1.0,
+    0.0,
+    2.0,
+    1.0,
+    0.0,
+    2.0,
+    -1.0,
+    1.0,
+    2.0,
+    1.0,
+    1.0,
+    2.0
+  ],
+  "tolerance": 0.0001,
+  "weight": 1.0
+}

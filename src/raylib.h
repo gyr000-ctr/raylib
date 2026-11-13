@@ -342,6 +342,22 @@ typedef struct Camera2D {
     float zoom;             // Camera zoom (scaling around target), must not be set to 0, set to 1.0f for no scale
 } Camera2D;
 
+#ifndef MAX_MESH_MORPH_TARGETS
+    #define MAX_MESH_MORPH_TARGETS  32      // Maximum number of morph targets (blend shapes) per mesh
+#endif
+
+// Morph target (blend shape) vertex deltas for a single target
+// NOTE: Only the attributes provided by the glTF target are non-NULL,
+// target deltas are stored in the same component layout as Mesh attributes
+typedef struct MeshMorphTarget {
+    char name[32];          // Morph target name (empty if unnamed)
+    float *positions;       // Position deltas (XYZ - 3 components per vertex), NULL if not provided
+    float *normals;         // Normal deltas (XYZ - 3 components per vertex), NULL if not provided
+    float *tangents;        // Tangent deltas (XYZ - 3 components per vertex, w sign kept from base), NULL if not provided
+    float *texcoords;       // Texcoord 0 deltas (UV - 2 components per vertex), NULL if not provided
+    float *texcoords2;      // Texcoord 1 deltas (UV - 2 components per vertex), NULL if not provided
+} MeshMorphTarget;
+
 // Mesh, vertex data and vao/vbo
 typedef struct Mesh {
     int vertexCount;        // Number of vertices stored in arrays
@@ -365,6 +381,21 @@ typedef struct Mesh {
     // NOTE: In case of GPU skinning, not used, pointers are NULL
     float *animVertices;    // Animated vertex positions (after bones transformations)
     float *animNormals;     // Animated normals (after bones transformations)
+
+    // Morph target (blend shape) data, loaded from glTF morph targets
+    // NOTE: Base vertex attributes stay untouched, morphing is applied on the
+    // runtime arrays below (and mirrored to the GPU vertex buffers when uploaded)
+    int morphTargetCount;           // Number of morph targets (MAX: MAX_MESH_MORPH_TARGETS)
+    MeshMorphTarget *morphTargets;  // Morph targets array with per-target vertex deltas
+    float *morphWeights;            // Current morph target weights, one per target
+    float *morphDefaultWeights;     // Default morph target weights (glTF mesh/node weights), one per target
+
+    // Runtime morph results, allocated once on load, never reallocated per frame
+    float *morphVertices;   // Morphed vertex positions (before skinning when skinned)
+    float *morphNormals;    // Morphed vertex normals
+    float *morphTangents;   // Morphed vertex tangents (XYZW - 4 components per vertex)
+    float *morphTexcoords;  // Morphed texture coordinates 0
+    float *morphTexcoords2; // Morphed texture coordinates 1
 
     // OpenGL identifiers
     unsigned int vaoId;     // OpenGL Vertex Array Object id
@@ -439,7 +470,34 @@ typedef struct ModelAnimation {
     unsigned int boneCount; // Number of bones (per pose)
     int keyframeCount;      // Number of animation key frames
     ModelAnimPose *keyframePoses; // Animation sequence keyframe poses [keyframe][pose]
+
+    // Morph target (blend shape) weight channels, glTF path: "weights"
+    // NOTE: Independent from bone data, an animation may contain only morph channels
+    int morphChannelCount;          // Number of morph weight channels
+    struct MeshMorphChannel *morphChannels; // Morph weight channels (one per animated glTF mesh node)
 } ModelAnimation;
+
+// Morph target weight channel interpolation method
+typedef enum {
+    MORPH_INTERPOLATION_CALCULATED = 0,    // Linear, calculated on evaluation
+    MORPH_INTERPOLATION_STEP = 1,          // Step, discrete value changes
+    MORPH_INTERPOLATION_CUBICSPLINE = 2    // Cubic spline, hermite interpolation with tangents
+} MorphChannelInterpolation;
+
+// Morph target weight animation channel for one mesh
+// NOTE: Keyframes are kept at their native glTF times (seconds), evaluation
+// samples the channel at any time, so STEP and CUBICSPLINE keep full precision
+// (morph channels are not baked at the animation framerate)
+typedef struct MeshMorphChannel {
+    int meshId;                     // First target mesh index on Model.meshes for the glTF node
+    int meshCount;                  // Number of consecutive raylib meshes (one per glTF primitive) covered by the node
+    int targetCount;                // Number of morph targets (weight components per keyframe)
+    int keyframeCount;              // Number of keyframes
+    MorphChannelInterpolation interpolation; // Interpolation method of the glTF sampler
+    float *times;                   // Keyframe times in seconds [keyframeCount]
+    float *values;                  // Weight values, linear/step: [keyframeCount*targetCount],
+                                    // cubic spline: [keyframeCount*3*targetCount] (in-tangent, value, out-tangent per keyframe)
+} MeshMorphChannel;
 
 // Ray, ray for raycasting
 typedef struct Ray {
@@ -1663,6 +1721,14 @@ RLAPI void UpdateModelAnimation(Model model, ModelAnimation anim, float frame); 
 RLAPI void UpdateModelAnimationEx(Model model, ModelAnimation animA, float frameA, ModelAnimation animB, float frameB, float blend); // Update model animation pose, blending two animations
 RLAPI void UnloadModelAnimations(ModelAnimation *animations, int animCount);                // Unload animation array data
 RLAPI bool IsModelAnimationValid(Model model, ModelAnimation anim);                         // Check model animation skeleton match
+
+// Model morph target (blend shape) functions
+RLAPI int GetMeshMorphTargetCount(Mesh mesh);                                              // Get number of morph targets in a mesh
+RLAPI const char *GetMeshMorphTargetName(Mesh mesh, int targetIndex);                      // Get morph target name (NULL if invalid/unnamed)
+RLAPI void SetMeshMorphWeight(Mesh *mesh, int targetIndex, float weight);                  // Set a morph target weight (non-finite values are ignored)
+RLAPI float GetMeshMorphWeight(Mesh mesh, int targetIndex);                                // Get a morph target weight (0.0f if invalid)
+RLAPI void UpdateModelMorph(Model model, ModelAnimation anim, float frame);                // Evaluate morph weight channels at a frame and apply them to the model meshes
+RLAPI void ResetModelMorphWeights(Model model);                                            // Reset all mesh morph weights to their default values and reapply them
 
 // Collision detection functions
 RLAPI bool CheckCollisionSpheres(Vector3 center1, float radius1, Vector3 center2, float radius2); // Check collision between two spheres

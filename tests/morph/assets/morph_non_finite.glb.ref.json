@@ -1,0 +1,33 @@
+{
+  "asset": "morph_non_finite.glb",
+  "defaultWeights": [
+    0.0
+  ],
+  "note": "Animation keyframe 0 embeds a binary NaN weight; loader must clamp to 0 and warn",
+  "samples": [
+    {
+      "frame": 0,
+      "positions": [
+        -1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        -1.0,
+        1.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0
+      ],
+      "weights": [
+        0.0
+      ]
+    }
+  ],
+  "targetNames": [
+    "bad_weight"
+  ],
+  "tolerance": 0.0001
+}

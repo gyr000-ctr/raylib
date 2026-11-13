@@ -1,0 +1,10 @@
+{
+  "asset": "morph_sparse.glb",
+  "expectNormalsLoaded": true,
+  "expectPositionsLoaded": false,
+  "expectedLoadedTargets": 1,
+  "targetNames": [
+    "sparse_lift"
+  ],
+  "tolerance": 0.0001
+}
