@@ -706,6 +706,8 @@ MODELS = \
     models/models_heightmap_rendering \
     models/models_loading \
     models/models_loading_gltf \
+    models/models_loading_gltf_specgloss \
+    models/models_loading_gltf_specgloss_compare \
     models/models_loading_iqm \
     models/models_loading_m3d \
     models/models_loading_vox \

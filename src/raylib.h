@@ -778,7 +778,9 @@ typedef enum {
     MATERIAL_MAP_CUBEMAP,           // Cubemap material (NOTE: Uses GL_TEXTURE_CUBE_MAP)
     MATERIAL_MAP_IRRADIANCE,        // Irradiance material (NOTE: Uses GL_TEXTURE_CUBE_MAP)
     MATERIAL_MAP_PREFILTER,         // Prefilter material (NOTE: Uses GL_TEXTURE_CUBE_MAP)
-    MATERIAL_MAP_BRDF               // Brdf material
+    MATERIAL_MAP_BRDF,              // Brdf material
+    MATERIAL_MAP_SPECULAR_GLOSSINESS, // Specular-glossiness texture (KHR_materials_pbrSpecularGlossiness, rgb: specular color, a: glossiness)
+    MATERIAL_MAP_GLOSSINESS         // Glossiness material scalar (KHR_materials_pbrSpecularGlossiness, value: glossiness factor)
 } MaterialMapIndex;
 
 #define MATERIAL_MAP_DIFFUSE      MATERIAL_MAP_ALBEDO
@@ -817,7 +819,9 @@ typedef enum {
     SHADER_LOC_VERTEX_BONEIDS,      // Shader location: vertex attribute: bone indices
     SHADER_LOC_VERTEX_BONEWEIGHTS,  // Shader location: vertex attribute: bone weights
     SHADER_LOC_MATRIX_BONETRANSFORMS, // Shader location: matrix attribute: bone transforms (animation)
-    SHADER_LOC_VERTEX_INSTANCETRANSFORM // Shader location: vertex attribute: instance transforms
+    SHADER_LOC_VERTEX_INSTANCETRANSFORM, // Shader location: vertex attribute: instance transforms
+    SHADER_LOC_MAP_SPECULAR_GLOSSINESS, // Shader location: sampler2d texture: specular-glossiness (rgb: specular, a: glossiness)
+    SHADER_LOC_COLOR_GLOSSINESS       // Shader location: float uniform: glossiness factor
 } ShaderLocationIndex;
 
 #define SHADER_LOC_MAP_DIFFUSE      SHADER_LOC_MAP_ALBEDO

@@ -71,6 +71,7 @@
 
     #define CGLTF_IMPLEMENTATION
     #include "external/cgltf.h"         // glTF file format loading
+    #include "rmodels_sg_shader.h"      // PBR specular-glossiness shader (KHR_materials_pbrSpecularGlossiness)
 #endif
 #if SUPPORT_FILEFORMAT_GLTF_WRITE
     // NOTE: No need for custom allocators, memory buffer provided
@@ -129,8 +130,19 @@
 // Defines and Macros
 //----------------------------------------------------------------------------------
 #ifndef MAX_MATERIAL_MAPS
-    #define MAX_MATERIAL_MAPS       12      // Maximum number of maps supported
+    #define MAX_MATERIAL_MAPS       14      // Maximum number of maps supported
 #endif
+
+// PBR specular-glossiness workflow state (KHR_materials_pbrSpecularGlossiness)
+// Declared here so DrawMesh() can reference it; populated inside the glTF loader
+static Shader gltfSpecGlossinessShader = { 0 };
+static int locSGAlphaCutoff = -1;
+static int locSGDoubleSided = -1;
+static int locSGUseSpecGlossMap = -1;
+static int locSGUseNormalMap = -1;
+static int locSGUseOcclusionMap = -1;
+static int locSGLightDirection = -1;
+static int locSGLightColor = -1;
 #ifndef MAX_MESH_VERTEX_BUFFERS
 #if SUPPORT_GPU_SKINNING
     // NOTE: Two additional vertex buffers required to store bone indices and bone weights
@@ -1446,6 +1458,78 @@ void UpdateMeshBuffer(Mesh mesh, int index, const void *data, int dataSize, int 
     rlUpdateVertexBuffer(mesh.vboId[index], data, dataSize, offset);
 }
 
+// Apply KHR_materials_pbrSpecularGlossiness uniforms and render state for one draw call.
+// Returns flags (bit 0: blending changed, bit 1: face culling changed) so the caller can
+// restore the previous GL state. No-op for metallic/roughness and user materials.
+static int ApplySpecularGlossinessState(Material material)
+{
+    int changed = 0;
+
+    if ((gltfSpecGlossinessShader.id != 0) && (material.shader.id == gltfSpecGlossinessShader.id))
+    {
+        // Scalar glossiness factor (texture alpha modulates it inside the shader)
+        if (material.shader.locs[SHADER_LOC_COLOR_GLOSSINESS] != -1)
+        {
+            float glossiness = material.maps[MATERIAL_MAP_GLOSSINESS].value;
+            rlSetUniform(material.shader.locs[SHADER_LOC_COLOR_GLOSSINESS], &glossiness, SHADER_UNIFORM_FLOAT, 1);
+        }
+
+        // Per-material workflow control uniforms (the program is shared, so these must be
+        // uploaded on every draw rather than written once at load time)
+        int useSgMap = material.maps[MATERIAL_MAP_SPECULAR_GLOSSINESS].texture.id > 0 ? 1 : 0;
+        int useNormalMap = material.maps[MATERIAL_MAP_NORMAL].texture.id > 0 ? 1 : 0;
+        int useOcclusionMap = material.maps[MATERIAL_MAP_OCCLUSION].texture.id > 0 ? 1 : 0;
+        int doubleSided = (int)material.maps[MATERIAL_MAP_GLOSSINESS].color.a;
+
+        if (locSGUseSpecGlossMap != -1) rlSetUniform(locSGUseSpecGlossMap, &useSgMap, SHADER_UNIFORM_INT, 1);
+        if (locSGUseNormalMap != -1) rlSetUniform(locSGUseNormalMap, &useNormalMap, SHADER_UNIFORM_INT, 1);
+        if (locSGUseOcclusionMap != -1) rlSetUniform(locSGUseOcclusionMap, &useOcclusionMap, SHADER_UNIFORM_INT, 1);
+        if (locSGDoubleSided != -1) rlSetUniform(locSGDoubleSided, &doubleSided, SHADER_UNIFORM_INT, 1);
+        if (locSGAlphaCutoff != -1)
+        {
+            float alphaCutoff = material.maps[MATERIAL_MAP_OCCLUSION].value;
+            rlSetUniform(locSGAlphaCutoff, &alphaCutoff, SHADER_UNIFORM_FLOAT, 1);
+        }
+
+        // The combined specular-glossiness texture is bound to unit MATERIAL_MAP_SPECULAR_GLOSSINESS
+        // (12) by the generic DrawMesh() texture loop, but the default sampler auto-binding only
+        // covers the legacy maps 0..10, so point texture12 at that unit explicitly
+        int sgTextureUnit = MATERIAL_MAP_SPECULAR_GLOSSINESS;
+        if (material.shader.locs[SHADER_LOC_MAP_SPECULAR_GLOSSINESS] != -1)
+            rlSetUniform(material.shader.locs[SHADER_LOC_MAP_SPECULAR_GLOSSINESS], &sgTextureUnit, SHADER_UNIFORM_INT, 1);
+
+        // Fixed directional lighting, identical for all fixtures (comparable screenshots)
+        if (locSGLightDirection != -1)
+        {
+            float lightDir[3] = { 0.5f, -1.0f, 0.35f };
+            rlSetUniform(locSGLightDirection, lightDir, SHADER_UNIFORM_VEC3, 1);
+        }
+        if (locSGLightColor != -1)
+        {
+            float lightColor[3] = { 1.0f, 1.0f, 1.0f };
+            rlSetUniform(locSGLightColor, lightColor, SHADER_UNIFORM_VEC3, 1);
+        }
+    }
+
+    // Alpha blending and double-sided state; the flags default to 0 on other materials,
+    // so metallic/roughness rendering keeps its exact previous GL state
+    int sgAlphaMode = material.maps[MATERIAL_MAP_GLOSSINESS].color.r;
+    int sgDoubleSided = material.maps[MATERIAL_MAP_GLOSSINESS].color.a;
+    if (sgAlphaMode == 1)
+    {
+        rlSetBlendMode(BLEND_ALPHA);
+        rlEnableColorBlend();
+        changed |= 1;
+    }
+    if (sgDoubleSided == 1)
+    {
+        rlDisableBackfaceCulling();
+        changed |= 2;
+    }
+
+    return changed;
+}
+
 // Draw a 3d mesh with material and transform
 void DrawMesh(Mesh mesh, Material material, Matrix transform)
 {
@@ -1518,6 +1602,21 @@ void DrawMesh(Mesh mesh, Material material, Matrix transform)
         };
 
         rlSetUniform(material.shader.locs[SHADER_LOC_COLOR_SPECULAR], values, SHADER_UNIFORM_VEC4, 1);
+    }
+
+    // Upload specular-glossiness workflow uniforms and render state
+    // (KHR_materials_pbrSpecularGlossiness); no-op for the default shader path
+    int sgStateChanged = ApplySpecularGlossinessState(material);
+    int blendChanged = (sgStateChanged & 1);
+    int cullingChanged = (sgStateChanged & 2);
+
+    // Camera world position, derived from the current view matrix set by BeginMode3D()
+    if (material.shader.locs[SHADER_LOC_VECTOR_VIEW] != -1)
+    {
+        Matrix view = rlGetMatrixModelview();
+        Matrix viewInv = MatrixInvert(view);
+        float viewPos[3] = { viewInv.m12, viewInv.m13, viewInv.m14 };
+        rlSetUniform(material.shader.locs[SHADER_LOC_VECTOR_VIEW], viewPos, SHADER_UNIFORM_VEC3, 1);
     }
 
     // Get a copy of current matrices to work with,
@@ -1694,6 +1793,10 @@ void DrawMesh(Mesh mesh, Material material, Matrix transform)
     // Disable shader program
     rlDisableShader();
 
+    // Restore render state changed for the specular-glossiness material
+    if (cullingChanged) rlEnableBackfaceCulling();
+    if (blendChanged) rlDisableColorBlend();
+
     // Restore rlgl internal modelview and projection matrices
     rlSetMatrixModelview(matView);
     rlSetMatrixProjection(matProjection);
@@ -1737,6 +1840,18 @@ void DrawMeshInstanced(Mesh mesh, Material material, const Matrix *transforms, i
         };
 
         rlSetUniform(material.shader.locs[SHADER_LOC_COLOR_SPECULAR], values, SHADER_UNIFORM_VEC4, 1);
+    }
+
+    // Upload specular-glossiness workflow uniforms and render state
+    // (KHR_materials_pbrSpecularGlossiness); no-op for the default shader path
+    int sgStateChanged = ApplySpecularGlossinessState(material);
+
+    // Camera world position, derived from the current view matrix set by BeginMode3D()
+    if (material.shader.locs[SHADER_LOC_VECTOR_VIEW] != -1)
+    {
+        Matrix viewInv = MatrixInvert(rlGetMatrixModelview());
+        float viewPos[3] = { viewInv.m12, viewInv.m13, viewInv.m14 };
+        rlSetUniform(material.shader.locs[SHADER_LOC_VECTOR_VIEW], viewPos, SHADER_UNIFORM_VEC3, 1);
     }
 
     // Get a copy of current matrices to work with,
@@ -1932,6 +2047,10 @@ void DrawMeshInstanced(Mesh mesh, Material material, const Matrix *transforms, i
 
     // Disable shader program
     rlDisableShader();
+
+    // Restore render state changed for the specular-glossiness material
+    if (sgStateChanged & 2) rlEnableBackfaceCulling();
+    if (sgStateChanged & 1) rlDisableColorBlend();
 
     // Remove instance transforms buffer
     rlUnloadVertexBuffer(instancesVboId);
@@ -5374,6 +5493,93 @@ static void ReleaseFileGLTFCallback(const struct cgltf_memory_options *memoryOpt
     UnloadFileData((unsigned char *)data);
 }
 
+// PBR specular-glossiness shader cache
+// NOTE: The shader program is compiled once and shared (by id) by every material requiring
+// the KHR_materials_pbrSpecularGlossiness workflow; each material keeps its own locs array.
+// It is never explicitly unloaded, like the rlgl default shader, so it lives until context close.
+
+// Locations of the workflow control uniforms. The public ShaderLocationIndex enum already
+// fills all 32 locs slots, so these shader-private uniforms are resolved once here and
+// uploaded per material from DrawMesh() (the program is shared, so setting them at load
+// time would let one material overwrite another material's values)
+
+// Load (once) the PBR specular-glossiness shader and resolve all uniform locations
+// Returns true on success; on failure the caller keeps the rlgl default material shader.
+static bool LoadGLTFSpecularGlossinessShader(Shader *outShader)
+{
+    if (gltfSpecGlossinessShader.id == 0)
+    {
+#if defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES2)
+        const char *vsCode =
+#if defined(GRAPHICS_API_OPENGL_ES2)
+            RMODELS_SG_VS_ES;
+#else
+            RMODELS_SG_VS;
+#endif
+        const char *fsCode =
+#if defined(GRAPHICS_API_OPENGL_ES2)
+            RMODELS_SG_FS_ES;
+#else
+            RMODELS_SG_FS;
+#endif
+        gltfSpecGlossinessShader = LoadShaderFromMemory(vsCode, fsCode);
+
+        if (gltfSpecGlossinessShader.id == rlGetShaderIdDefault())
+        {
+            // Compilation/link failure: LoadShaderFromMemory() falls back to the default shader
+            TRACELOG(LOG_WARNING, "GLTF: Failed to compile PBR specular-glossiness shader, fallback to default shader");
+            gltfSpecGlossinessShader.id = 0;
+            return false;
+        }
+
+        // Public locations not bound automatically by LoadShader() (default names only),
+        // resolved a single time here and copied into every material that uses the program
+        int *locs = gltfSpecGlossinessShader.locs;
+        locs[SHADER_LOC_COLOR_SPECULAR] = GetShaderLocation(gltfSpecGlossinessShader, "colSpecular");
+        locs[SHADER_LOC_COLOR_GLOSSINESS] = GetShaderLocation(gltfSpecGlossinessShader, "glossinessValue");
+        locs[SHADER_LOC_MAP_SPECULAR_GLOSSINESS] = GetShaderLocation(gltfSpecGlossinessShader, "texture12");
+        locs[SHADER_LOC_VECTOR_VIEW] = GetShaderLocation(gltfSpecGlossinessShader, "viewPos");
+
+        // Shader-private workflow/lighting uniforms
+        locSGAlphaCutoff = GetShaderLocation(gltfSpecGlossinessShader, "alphaCutoff");
+        locSGDoubleSided = GetShaderLocation(gltfSpecGlossinessShader, "doubleSided");
+        locSGUseSpecGlossMap = GetShaderLocation(gltfSpecGlossinessShader, "useMapSpecularGlossiness");
+        locSGUseNormalMap = GetShaderLocation(gltfSpecGlossinessShader, "useMapNormal");
+        locSGUseOcclusionMap = GetShaderLocation(gltfSpecGlossinessShader, "useMapOcclusion");
+        locSGLightDirection = GetShaderLocation(gltfSpecGlossinessShader, "lightDirection");
+        locSGLightColor = GetShaderLocation(gltfSpecGlossinessShader, "lightColor");
+#else
+        TRACELOG(LOG_WARNING, "GLTF: PBR specular-glossiness workflow requires OpenGL 3.3/ES2+, fallback to default shader");
+        return false;
+#endif
+    }
+
+    if (gltfSpecGlossinessShader.id == 0) return false;
+
+    // Every material gets its own locs array (freed with the model), but shares the GPU program
+    outShader->id = gltfSpecGlossinessShader.id;
+    outShader->locs = (int *)RL_CALLOC(RL_MAX_SHADER_LOCATIONS, sizeof(int));
+    for (int i = 0; i < RL_MAX_SHADER_LOCATIONS; i++) outShader->locs[i] = gltfSpecGlossinessShader.locs[i];
+
+    return true;
+}
+
+// Clamp a glTF color/factor component into the valid [min,max] range and warn on clipping
+static float ClampGLTFFactor(float value, float minValue, float maxValue, const char *factorName)
+{
+    if (isnan(value) || isinf(value))
+    {
+        TRACELOG(LOG_WARNING, "GLTF: Invalid %s value (%f), reset to %f", factorName, value, minValue);
+        return minValue;
+    }
+    if ((value < minValue) || (value > maxValue))
+    {
+        TRACELOG(LOG_WARNING, "GLTF: %s value out of range (%f), clamped to [%f..%f]", factorName, value, minValue, maxValue);
+        return Clamp(value, minValue, maxValue);
+    }
+    return value;
+}
+
 // Load image from different glTF provided methods (uri, path, buffer_view)
 static Image LoadImageFromCgltfImage(cgltf_image *cgltfImage, const char *texPath)
 {
@@ -5618,9 +5824,144 @@ static Model LoadGLTF(const char *fileName)
             model.materials[j] = LoadMaterialDefault();
             const char *texPath = GetDirectoryPath(fileName);
 
+            // KHR_materials_pbrSpecularGlossiness: specular/glossiness flow
+            // NOTE: Per glTF 2.0 spec, when this extension is used it replaces the metallic/roughness
+            // PBR parameters; both blocks may be present in the file but the extension takes precedence
+            if (data->materials[i].has_pbr_specular_glossiness)
+            {
+                cgltf_pbr_specular_glossiness *sg = &data->materials[i].pbr_specular_glossiness;
+
+                // Load the shared specular-glossiness PBR shader (compiled once, cached)
+                Shader sgShader = { 0 };
+                bool shaderReady = LoadGLTFSpecularGlossinessShader(&sgShader);
+                if (shaderReady) model.materials[j].shader = sgShader;
+
+                // Diffuse factor (4 components, linear color + alpha)
+                // NOTE: Values are clamped into the legal range, malformed numbers fall back to defaults
+                float diffuseR = ClampGLTFFactor(sg->diffuse_factor[0], 0.0f, 1.0f, "diffuseFactor.r");
+                float diffuseG = ClampGLTFFactor(sg->diffuse_factor[1], 0.0f, 1.0f, "diffuseFactor.g");
+                float diffuseB = ClampGLTFFactor(sg->diffuse_factor[2], 0.0f, 1.0f, "diffuseFactor.b");
+                float diffuseA = ClampGLTFFactor(sg->diffuse_factor[3], 0.0f, 1.0f, "diffuseFactor.a");
+
+                model.materials[j].maps[MATERIAL_MAP_ALBEDO].color = (Color){
+                    (unsigned char)(diffuseR*255.0f),
+                    (unsigned char)(diffuseG*255.0f),
+                    (unsigned char)(diffuseB*255.0f),
+                    (unsigned char)(diffuseA*255.0f)
+                };
+
+                // Specular factor (3 linear components). The 4th channel of the specular color
+                // stores the diffuse alpha on the legacy MATERIAL_MAP_SPECULAR slot for the
+                // colSpecular uniform (the SG shader only reads rgb from it)
+                float specR = ClampGLTFFactor(sg->specular_factor[0], 0.0f, 1.0f, "specularFactor.r");
+                float specG = ClampGLTFFactor(sg->specular_factor[1], 0.0f, 1.0f, "specularFactor.g");
+                float specB = ClampGLTFFactor(sg->specular_factor[2], 0.0f, 1.0f, "specularFactor.b");
+
+                model.materials[j].maps[MATERIAL_MAP_SPECULAR].color = (Color){
+                    (unsigned char)(specR*255.0f),
+                    (unsigned char)(specG*255.0f),
+                    (unsigned char)(specB*255.0f),
+                    (unsigned char)(diffuseA*255.0f)
+                };
+
+                // Glossiness scalar factor, validated into [0..1]
+                float glossiness = ClampGLTFFactor(sg->glossiness_factor, 0.0f, 1.0f, "glossinessFactor");
+                model.materials[j].maps[MATERIAL_MAP_GLOSSINESS].value = glossiness;
+
+                // Diffuse texture (base color + alpha, sRGB encoded)
+                if (sg->diffuse_texture.texture != NULL)
+                {
+                    Image imDiffuse = LoadImageFromCgltfImage(sg->diffuse_texture.texture->image, texPath);
+                    if ((imDiffuse.data != NULL) && (imDiffuse.width > 0) && (imDiffuse.height > 0))
+                    {
+                        model.materials[j].maps[MATERIAL_MAP_ALBEDO].texture = LoadTextureFromImage(imDiffuse);
+                        UnloadImage(imDiffuse);
+                    }
+                    else
+                    {
+                        TRACELOG(LOG_WARNING, "GLTF: Specular-glossiness diffuse texture invalid, using diffuse factor only");
+                        if (imDiffuse.data != NULL) UnloadImage(imDiffuse);
+                    }
+                }
+
+                // Specular-glossiness texture: rgb = specular color (linear), a = glossiness
+                // NOTE: Uploaded as a single RGBA texture shared by both signals, no per-mesh copies
+                if (sg->specular_glossiness_texture.texture != NULL)
+                {
+                    Image imSpecGloss = LoadImageFromCgltfImage(sg->specular_glossiness_texture.texture->image, texPath);
+                    if (imSpecGloss.data != NULL)
+                    {
+                        if ((imSpecGloss.width > 0) && (imSpecGloss.height > 0))
+                        {
+                            model.materials[j].maps[MATERIAL_MAP_SPECULAR_GLOSSINESS].texture = LoadTextureFromImage(imSpecGloss);
+                        }
+                        else TRACELOG(LOG_WARNING, "GLTF: Invalid specular-glossiness texture dimensions, texture ignored");
+                        UnloadImage(imSpecGloss);
+                    }
+                    else TRACELOG(LOG_WARNING, "GLTF: Specular-glossiness texture failed to load, using factors only");
+                }
+
+                // Normal texture (shared semantics with the metallic/roughness flow)
+                if (data->materials[i].normal_texture.texture != NULL)
+                {
+                    Image imNormal = LoadImageFromCgltfImage(data->materials[i].normal_texture.texture->image, texPath);
+                    if (imNormal.data != NULL)
+                    {
+                        model.materials[j].maps[MATERIAL_MAP_NORMAL].texture = LoadTextureFromImage(imNormal);
+                        UnloadImage(imNormal);
+                    }
+                }
+
+                // Ambient occlusion texture
+                if (data->materials[i].occlusion_texture.texture != NULL)
+                {
+                    Image imOcclusion = LoadImageFromCgltfImage(data->materials[i].occlusion_texture.texture->image, texPath);
+                    if (imOcclusion.data != NULL)
+                    {
+                        model.materials[j].maps[MATERIAL_MAP_OCCLUSION].texture = LoadTextureFromImage(imOcclusion);
+                        UnloadImage(imOcclusion);
+                    }
+                }
+
+                // Emissive texture and factor (extension does not redefine emission)
+                if (data->materials[i].emissive_texture.texture != NULL)
+                {
+                    Image imEmissive = LoadImageFromCgltfImage(data->materials[i].emissive_texture.texture->image, texPath);
+                    if (imEmissive.data != NULL)
+                    {
+                        model.materials[j].maps[MATERIAL_MAP_EMISSION].texture = LoadTextureFromImage(imEmissive);
+                        UnloadImage(imEmissive);
+                    }
+                }
+
+                model.materials[j].maps[MATERIAL_MAP_EMISSION].color.r = (unsigned char)(ClampGLTFFactor(data->materials[i].emissive_factor[0], 0.0f, 1.0f, "emissiveFactor.r")*255.0f);
+                model.materials[j].maps[MATERIAL_MAP_EMISSION].color.g = (unsigned char)(ClampGLTFFactor(data->materials[i].emissive_factor[1], 0.0f, 1.0f, "emissiveFactor.g")*255.0f);
+                model.materials[j].maps[MATERIAL_MAP_EMISSION].color.b = (unsigned char)(ClampGLTFFactor(data->materials[i].emissive_factor[2], 0.0f, 1.0f, "emissiveFactor.b")*255.0f);
+                model.materials[j].maps[MATERIAL_MAP_EMISSION].color.a = 255;
+
+                // Internal render-state flags read by DrawMesh()
+                // NOTE: Stored in unused color channels of material maps, no public struct change;
+                // set independently of shader compilation so the fallback path stays correct
+                int doubleSided = data->materials[i].double_sided ? 1 : 0;
+                model.materials[j].maps[MATERIAL_MAP_GLOSSINESS].color.a = (unsigned char)doubleSided;
+                if (data->materials[i].alpha_mode == cgltf_alpha_mode_blend)
+                    model.materials[j].maps[MATERIAL_MAP_GLOSSINESS].color.r = 1;
+                else if (data->materials[i].alpha_mode == cgltf_alpha_mode_mask)
+                    model.materials[j].maps[MATERIAL_MAP_GLOSSINESS].color.r = 2;
+
+                // Alpha cutoff for MASK mode; -1 disables masking (OPAQUE/BLEND).
+                // The occlusion slot's value is unused by the legacy pipeline, so it carries
+                // this workflow scalar to the per-material DrawMesh() uniform upload
+                float alphaCutoff = -1.0f;
+                if (data->materials[i].alpha_mode == cgltf_alpha_mode_mask)
+                {
+                    alphaCutoff = ClampGLTFFactor(data->materials[i].alpha_cutoff, 0.0f, 1.0f, "alphaCutoff");
+                }
+                model.materials[j].maps[MATERIAL_MAP_OCCLUSION].value = alphaCutoff;
+            }
             // Check glTF material flow: PBR metallic/roughness flow
             // NOTE: Alternatively, materials can follow PBR specular/glossiness flow
-            if (data->materials[i].has_pbr_metallic_roughness)
+            else if (data->materials[i].has_pbr_metallic_roughness)
             {
                 // Load base color texture (albedo)
                 if (data->materials[i].pbr_metallic_roughness.base_color_texture.texture)
@@ -5725,6 +6066,7 @@ static Model LoadGLTF(const char *fileName)
 
             // Other possible materials not supported by raylib pipeline:
             // has_clearcoat, has_transmission, has_volume, has_ior, has specular, has_sheen
+            // NOTE: KHR_materials_pbrSpecularGlossiness is supported above
         }
         //----------------------------------------------------------------------------------------------------
 
