@@ -365,6 +365,11 @@ struct rAudioBuffer {
     unsigned int frameCursorPos;    // Frame cursor position
     unsigned int framesProcessed;   // Total frames processed in this buffer (required for play timing)
 
+    bool loopPointsEnabled;         // Music sample-accurate loop points enabled
+    unsigned int loopStartFrame;    // Music loop start position in frames
+    unsigned int loopEndFrame;      // Music loop end position in frames (exclusive)
+    unsigned int streamPosition;    // Current music decoder position in frames (music streams only)
+
     unsigned char *data;            // Data buffer, on music stream keeps filling
 
     rAudioBuffer *next;             // Next audio buffer on the list
@@ -619,6 +624,11 @@ AudioBuffer *LoadAudioBuffer(ma_format format, ma_uint32 channels, ma_uint32 sam
     audioBuffer->framesProcessed = 0;
     audioBuffer->sizeInFrames = sizeInFrames;
 
+    audioBuffer->loopPointsEnabled = false;
+    audioBuffer->loopStartFrame = 0;
+    audioBuffer->loopEndFrame = 0;
+    audioBuffer->streamPosition = 0;
+
     // Buffers should be marked as processed by default so that a call to
     // UpdateAudioStream() immediately after initialization works correctly
     audioBuffer->isSubBufferProcessed[0] = true;
@@ -665,6 +675,7 @@ void PlayAudioBuffer(AudioBuffer *buffer)
         buffer->paused = false;
         buffer->frameCursorPos = 0;
         buffer->framesProcessed = 0;
+        buffer->streamPosition = 0;
         buffer->isSubBufferProcessed[0] = true;
         buffer->isSubBufferProcessed[1] = true;
         ma_mutex_unlock(&AUDIO.System.lock);
@@ -1337,6 +1348,84 @@ void UnloadWaveSamples(float *samples)
     RL_FREE(samples);
 }
 
+#if SUPPORT_FILEFORMAT_WAV
+// Check a drwav context for smpl chunk loop points and apply them as music loop points
+// NOTE: Only the first forward loop is considered, ping-pong/backward loops are ignored
+static void LoadMusicLoopPointsFromSmplChunk(Music music, drwav *ctxWav)
+{
+    for (drwav_uint32 i = 0; i < ctxWav->metadataCount; i++)
+    {
+        if (ctxWav->pMetadata[i].type == drwav_metadata_type_smpl)
+        {
+            drwav_smpl *smpl = &ctxWav->pMetadata[i].data.smpl;
+
+            for (drwav_uint32 j = 0; j < smpl->sampleLoopCount; j++)
+            {
+                if ((smpl->pLoops[j].type == drwav_smpl_loop_type_forward) &&
+                    (smpl->pLoops[j].lastSampleOffset > smpl->pLoops[j].firstSampleOffset))
+                {
+                    // NOTE: smpl loop end is inclusive, music loop points use an exclusive end
+                    SetMusicLoopPoints(music, smpl->pLoops[j].firstSampleOffset, smpl->pLoops[j].lastSampleOffset + 1);
+                    break;
+                }
+            }
+
+            break;
+        }
+    }
+}
+#endif
+
+#if SUPPORT_FILEFORMAT_OGG
+// Check if a Vorbis comment entry ("KEY=value") matches the given key, case-insensitive
+static bool IsVorbisCommentKey(const char *entry, const char *key)
+{
+    if (entry == NULL) return false;
+
+    while (*key != '\0')
+    {
+        char letter = *entry;
+        if ((letter >= 'a') && (letter <= 'z')) letter -= 32;    // Keys are case-insensitive
+        if ((letter != *key) || (letter == '\0')) return false;
+        entry++;
+        key++;
+    }
+
+    return (*entry == '=');
+}
+
+// Check a stb_vorbis context for LOOPSTART/LOOPLENGTH/LOOPEND comments and apply them as music loop points
+static void LoadMusicLoopPointsFromVorbisComments(Music music, stb_vorbis *ctxOgg)
+{
+    stb_vorbis_comment comment = stb_vorbis_get_comment(ctxOgg);
+    long long loopStart = -1;
+    long long loopLength = -1;
+    long long loopEnd = -1;
+
+    for (int i = 0; i < comment.comment_list_length; i++)
+    {
+        const char *entry = comment.comment_list[i];
+        const char *value = (entry != NULL)? strchr(entry, '=') : NULL;
+        if (value == NULL) continue;
+        value++;
+
+        if (IsVorbisCommentKey(entry, "LOOPSTART")) loopStart = strtoll(value, NULL, 10);
+        else if (IsVorbisCommentKey(entry, "LOOPLENGTH")) loopLength = strtoll(value, NULL, 10);
+        else if (IsVorbisCommentKey(entry, "LOOPEND")) loopEnd = strtoll(value, NULL, 10);
+    }
+
+    if ((loopStart >= 0) && (loopStart < (long long)music.frameCount))
+    {
+        long long end = (long long)music.frameCount;    // Default to full file length from loop start
+        if (loopLength > 0) end = loopStart + loopLength;
+        else if (loopEnd > loopStart) end = loopEnd;
+
+        // Out-of-bounds and invalid ranges are clamped/rejected by SetMusicLoopPoints()
+        SetMusicLoopPoints(music, (unsigned int)loopStart, (unsigned int)((end > 0)? end : 0));
+    }
+}
+#endif
+
 //----------------------------------------------------------------------------------
 // Module Functions Definition - Music loading and stream playing
 //----------------------------------------------------------------------------------
@@ -1352,7 +1441,7 @@ Music LoadMusicStream(const char *fileName)
     else if (IsFileExtension(fileName, ".wav"))
     {
         drwav *ctxWav = (drwav *)RL_CALLOC(1, sizeof(drwav));
-        bool success = drwav_init_file(ctxWav, fileName, NULL);
+        bool success = drwav_init_file_with_metadata(ctxWav, fileName, drwav_metadata_type_smpl, NULL);
 
         if (success)
         {
@@ -1364,6 +1453,9 @@ Music LoadMusicStream(const char *fileName)
             music.stream = LoadAudioStream(ctxWav->sampleRate, sampleSize, ctxWav->channels);
             music.frameCount = (unsigned int)ctxWav->totalPCMFrameCount;
             music.looping = true;   // Looping enabled by default
+
+            LoadMusicLoopPointsFromSmplChunk(music, ctxWav);    // Check for loop points in smpl chunk
+
             musicLoaded = true;
         }
         else
@@ -1390,6 +1482,9 @@ Music LoadMusicStream(const char *fileName)
             // WARNING: It seems this function returns length in frames, not samples, so multiply by channels
             music.frameCount = stb_vorbis_stream_length_in_samples((stb_vorbis *)music.ctxData);
             music.looping = true; // Looping enabled by default
+
+            LoadMusicLoopPointsFromVorbisComments(music, ctxOgg);   // Check for LOOPSTART/LOOPLENGTH comments
+
             musicLoaded = true;
         }
         else
@@ -1548,7 +1643,7 @@ Music LoadMusicStreamFromMemory(const char *fileType, const unsigned char *data,
     else if ((strcmp(fileType, ".wav") == 0) || (strcmp(fileType, ".WAV") == 0))
     {
         drwav *ctxWav = (drwav *)RL_CALLOC(1, sizeof(drwav));
-        bool success = drwav_init_memory(ctxWav, (const void *)data, dataSize, NULL);
+        bool success = drwav_init_memory_with_metadata(ctxWav, (const void *)data, dataSize, drwav_metadata_type_smpl, NULL);
 
         if (success)
         {
@@ -1560,6 +1655,9 @@ Music LoadMusicStreamFromMemory(const char *fileType, const unsigned char *data,
             music.stream = LoadAudioStream(ctxWav->sampleRate, sampleSize, ctxWav->channels);
             music.frameCount = (unsigned int)ctxWav->totalPCMFrameCount;
             music.looping = true;   // Looping enabled by default
+
+            LoadMusicLoopPointsFromSmplChunk(music, ctxWav);    // Check for loop points in smpl chunk
+
             musicLoaded = true;
         }
         else
@@ -1587,6 +1685,9 @@ Music LoadMusicStreamFromMemory(const char *fileType, const unsigned char *data,
             // WARNING: It seems this function returns length in frames, not samples, so multiply by channels
             music.frameCount = stb_vorbis_stream_length_in_samples((stb_vorbis *)music.ctxData);
             music.looping = true;   // Looping enabled by default
+
+            LoadMusicLoopPointsFromVorbisComments(music, ctxOgg);   // Check for LOOPSTART/LOOPLENGTH comments
+
             musicLoaded = true;
         }
         else
@@ -1846,13 +1947,26 @@ void SeekMusicStream(Music music, float position)
 
     unsigned int positionInFrames = (unsigned int)(position*music.stream.sampleRate);
 
+    // When custom loop points are active, seeking is limited to the looped region
+    if ((music.stream.buffer != NULL) && music.stream.buffer->loopPointsEnabled &&
+        (positionInFrames >= music.stream.buffer->loopEndFrame))
+    {
+        positionInFrames = music.stream.buffer->loopEndFrame - 1;
+    }
+
     switch (music.ctxType)
     {
 #if SUPPORT_FILEFORMAT_WAV
         case MUSIC_AUDIO_WAV: drwav_seek_to_pcm_frame((drwav *)music.ctxData, positionInFrames); break;
 #endif
 #if SUPPORT_FILEFORMAT_OGG
-        case MUSIC_AUDIO_OGG: stb_vorbis_seek_frame((stb_vorbis *)music.ctxData, positionInFrames); break;
+        case MUSIC_AUDIO_OGG:
+        {
+            // NOTE: With loop points active, seeking must be sample-accurate (stb_vorbis_seek),
+            // the default path keeps the block-accurate stb_vorbis_seek_frame()
+            if ((music.stream.buffer != NULL) && music.stream.buffer->loopPointsEnabled) stb_vorbis_seek((stb_vorbis *)music.ctxData, positionInFrames);
+            else stb_vorbis_seek_frame((stb_vorbis *)music.ctxData, positionInFrames);
+        } break;
 #endif
 #if SUPPORT_FILEFORMAT_MP3
         case MUSIC_AUDIO_MP3: drmp3_seek_to_pcm_frame((drmp3 *)music.ctxData, positionInFrames); break;
@@ -1875,6 +1989,7 @@ void SeekMusicStream(Music music, float position)
 
     ma_mutex_lock(&AUDIO.System.lock);
     music.stream.buffer->framesProcessed = positionInFrames;
+    music.stream.buffer->streamPosition = positionInFrames;
     music.stream.buffer->isSubBufferProcessed[0] = true;
     music.stream.buffer->isSubBufferProcessed[1] = true;
     ma_mutex_unlock(&AUDIO.System.lock);
@@ -1929,6 +2044,21 @@ void UpdateMusicStream(Music music)
         int frameCountStillNeeded = framesToStream;
         int frameCountReadTotal = 0;
 
+        // Sample-accurate loop points: when enabled (and looping), the decoder is
+        // seeked back to loopStartFrame every time loopEndFrame is reached,
+        // instead of wrapping to the beginning of the file at EOF
+        bool useLoopPoints = music.stream.buffer->loopPointsEnabled && music.looping;
+        unsigned int loopStartFrame = music.stream.buffer->loopStartFrame;
+        unsigned int loopEndFrame = music.stream.buffer->loopEndFrame;
+        unsigned int framesToLoopBoundary = 0;
+
+        if (useLoopPoints)
+        {
+            if (music.stream.buffer->streamPosition < loopEndFrame) framesToLoopBoundary = loopEndFrame - music.stream.buffer->streamPosition;
+            else framesToLoopBoundary = music.frameCount - music.stream.buffer->streamPosition; // Decoder past loop end (loop points set mid-playback): play out the tail, EOF wraps into the loop
+            if (framesToLoopBoundary == 0) framesToLoopBoundary = 1;    // Defensive: a 0-frame read triggers the EOF wrap below
+        }
+
         switch (music.ctxType)
         {
         #if SUPPORT_FILEFORMAT_WAV
@@ -1938,22 +2068,66 @@ void UpdateMusicStream(Music music)
                 {
                     while (true)
                     {
-                        int frameCountRead = (int)drwav_read_pcm_frames_s16((drwav *)music.ctxData, frameCountStillNeeded, (short *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize));
+                        int framesToRead = frameCountStillNeeded;
+                        if (useLoopPoints && (framesToRead > (int)framesToLoopBoundary)) framesToRead = (int)framesToLoopBoundary;
+
+                        int frameCountRead = (int)drwav_read_pcm_frames_s16((drwav *)music.ctxData, framesToRead, (short *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize));
                         frameCountReadTotal += frameCountRead;
                         frameCountStillNeeded -= frameCountRead;
+
+                        if (useLoopPoints)
+                        {
+                            music.stream.buffer->streamPosition += frameCountRead;
+                            framesToLoopBoundary -= frameCountRead;
+
+                            if ((framesToLoopBoundary == 0) || (frameCountRead == 0))
+                            {
+                                // Reached the loop end (or an unexpected EOF): wrap to the loop start
+                                drwav_seek_to_pcm_frame((drwav *)music.ctxData, loopStartFrame);
+                                music.stream.buffer->streamPosition = loopStartFrame;
+                                framesToLoopBoundary = loopEndFrame - loopStartFrame;
+                            }
+                        }
+
                         if (frameCountStillNeeded == 0) break;
-                        else drwav_seek_to_first_pcm_frame((drwav *)music.ctxData);
+                        else if (!useLoopPoints)
+                        {
+                            drwav_seek_to_first_pcm_frame((drwav *)music.ctxData);
+                            music.stream.buffer->streamPosition = 0;
+                        }
                     }
                 }
                 else if (music.stream.sampleSize == 32)
                 {
                     while (true)
                     {
-                        int frameCountRead = (int)drwav_read_pcm_frames_f32((drwav *)music.ctxData, frameCountStillNeeded, (float *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize));
+                        int framesToRead = frameCountStillNeeded;
+                        if (useLoopPoints && (framesToRead > (int)framesToLoopBoundary)) framesToRead = (int)framesToLoopBoundary;
+
+                        int frameCountRead = (int)drwav_read_pcm_frames_f32((drwav *)music.ctxData, framesToRead, (float *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize));
                         frameCountReadTotal += frameCountRead;
                         frameCountStillNeeded -= frameCountRead;
+
+                        if (useLoopPoints)
+                        {
+                            music.stream.buffer->streamPosition += frameCountRead;
+                            framesToLoopBoundary -= frameCountRead;
+
+                            if ((framesToLoopBoundary == 0) || (frameCountRead == 0))
+                            {
+                                // Reached the loop end (or an unexpected EOF): wrap to the loop start
+                                drwav_seek_to_pcm_frame((drwav *)music.ctxData, loopStartFrame);
+                                music.stream.buffer->streamPosition = loopStartFrame;
+                                framesToLoopBoundary = loopEndFrame - loopStartFrame;
+                            }
+                        }
+
                         if (frameCountStillNeeded == 0) break;
-                        else drwav_seek_to_first_pcm_frame((drwav *)music.ctxData);
+                        else if (!useLoopPoints)
+                        {
+                            drwav_seek_to_first_pcm_frame((drwav *)music.ctxData);
+                            music.stream.buffer->streamPosition = 0;
+                        }
                     }
                 }
             } break;
@@ -1963,11 +2137,34 @@ void UpdateMusicStream(Music music)
             {
                 while (true)
                 {
-                    int frameCountRead = stb_vorbis_get_samples_short_interleaved((stb_vorbis *)music.ctxData, music.stream.channels, (short *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize), frameCountStillNeeded*music.stream.channels);
+                    int framesToRead = frameCountStillNeeded;
+                    if (useLoopPoints && (framesToRead > (int)framesToLoopBoundary)) framesToRead = (int)framesToLoopBoundary;
+
+                    int frameCountRead = stb_vorbis_get_samples_short_interleaved((stb_vorbis *)music.ctxData, music.stream.channels, (short *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize), framesToRead*music.stream.channels);
                     frameCountReadTotal += frameCountRead;
                     frameCountStillNeeded -= frameCountRead;
+
+                    if (useLoopPoints)
+                    {
+                        music.stream.buffer->streamPosition += frameCountRead;
+                        framesToLoopBoundary -= frameCountRead;
+
+                        if ((framesToLoopBoundary == 0) || (frameCountRead == 0))
+                        {
+                            // Reached the loop end (or an unexpected EOF): wrap to the loop start
+                            // NOTE: stb_vorbis_seek() is sample-accurate, stb_vorbis_seek_frame() only lands on the containing vorbis block
+                            stb_vorbis_seek((stb_vorbis *)music.ctxData, loopStartFrame);
+                            music.stream.buffer->streamPosition = loopStartFrame;
+                            framesToLoopBoundary = loopEndFrame - loopStartFrame;
+                        }
+                    }
+
                     if (frameCountStillNeeded == 0) break;
-                    else stb_vorbis_seek_start((stb_vorbis *)music.ctxData);
+                    else if (!useLoopPoints)
+                    {
+                        stb_vorbis_seek_start((stb_vorbis *)music.ctxData);
+                        music.stream.buffer->streamPosition = 0;
+                    }
                 }
             } break;
         #endif
@@ -1976,11 +2173,33 @@ void UpdateMusicStream(Music music)
             {
                 while (true)
                 {
-                    int frameCountRead = (int)drmp3_read_pcm_frames_f32((drmp3 *)music.ctxData, frameCountStillNeeded, (float *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize));
+                    int framesToRead = frameCountStillNeeded;
+                    if (useLoopPoints && (framesToRead > (int)framesToLoopBoundary)) framesToRead = (int)framesToLoopBoundary;
+
+                    int frameCountRead = (int)drmp3_read_pcm_frames_f32((drmp3 *)music.ctxData, framesToRead, (float *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize));
                     frameCountReadTotal += frameCountRead;
                     frameCountStillNeeded -= frameCountRead;
+
+                    if (useLoopPoints)
+                    {
+                        music.stream.buffer->streamPosition += frameCountRead;
+                        framesToLoopBoundary -= frameCountRead;
+
+                        if ((framesToLoopBoundary == 0) || (frameCountRead == 0))
+                        {
+                            // Reached the loop end (or an unexpected EOF): wrap to the loop start
+                            drmp3_seek_to_pcm_frame((drmp3 *)music.ctxData, loopStartFrame);
+                            music.stream.buffer->streamPosition = loopStartFrame;
+                            framesToLoopBoundary = loopEndFrame - loopStartFrame;
+                        }
+                    }
+
                     if (frameCountStillNeeded == 0) break;
-                    else drmp3_seek_to_start_of_stream((drmp3 *)music.ctxData);
+                    else if (!useLoopPoints)
+                    {
+                        drmp3_seek_to_start_of_stream((drmp3 *)music.ctxData);
+                        music.stream.buffer->streamPosition = 0;
+                    }
                 }
             } break;
         #endif
@@ -2006,11 +2225,33 @@ void UpdateMusicStream(Music music)
             {
                 while (true)
                 {
-                    int frameCountRead = (int)drflac_read_pcm_frames_s16((drflac *)music.ctxData, frameCountStillNeeded, (short *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize));
+                    int framesToRead = frameCountStillNeeded;
+                    if (useLoopPoints && (framesToRead > (int)framesToLoopBoundary)) framesToRead = (int)framesToLoopBoundary;
+
+                    int frameCountRead = (int)drflac_read_pcm_frames_s16((drflac *)music.ctxData, framesToRead, (short *)((char *)AUDIO.System.pcmBuffer + frameCountReadTotal*frameSize));
                     frameCountReadTotal += frameCountRead;
                     frameCountStillNeeded -= frameCountRead;
+
+                    if (useLoopPoints)
+                    {
+                        music.stream.buffer->streamPosition += frameCountRead;
+                        framesToLoopBoundary -= frameCountRead;
+
+                        if ((framesToLoopBoundary == 0) || (frameCountRead == 0))
+                        {
+                            // Reached the loop end (or an unexpected EOF): wrap to the loop start
+                            drflac_seek_to_pcm_frame((drflac *)music.ctxData, loopStartFrame);
+                            music.stream.buffer->streamPosition = loopStartFrame;
+                            framesToLoopBoundary = loopEndFrame - loopStartFrame;
+                        }
+                    }
+
                     if (frameCountStillNeeded == 0) break;
-                    else drflac__seek_to_first_frame((drflac *)music.ctxData);
+                    else if (!useLoopPoints)
+                    {
+                        drflac__seek_to_first_frame((drflac *)music.ctxData);
+                        music.stream.buffer->streamPosition = 0;
+                    }
                 }
             } break;
         #endif
@@ -2067,6 +2308,82 @@ void SetMusicPan(Music music, float pan)
     SetAudioBufferPan(music.stream.buffer, pan);
 }
 
+// Set music loop points (in frames)
+// When set and music looping is enabled, playback wraps from loopEnd back to loopStart
+// instead of restarting the full stream; loop points are sample-accurate
+// NOTE 1: loopEnd is exclusive, valid range is 0 <= loopStart < loopEnd <= frameCount
+// NOTE 2: loopEnd values past the end of the stream are clamped to frameCount
+// NOTE 3: Setting loopEnd to 0 clears the custom loop points (full stream looping)
+// NOTE 4: Only supported by seekable PCM formats (WAV, OGG, MP3, FLAC)
+void SetMusicLoopPoints(Music music, unsigned int loopStart, unsigned int loopEnd)
+{
+    if (music.stream.buffer == NULL)
+    {
+        TRACELOG(LOG_WARNING, "MUSIC: Loop points require a valid music stream");
+        return;
+    }
+
+    ma_mutex_lock(&AUDIO.System.lock);
+
+    if (loopEnd == 0)
+    {
+        // Clearing custom loop points, back to full stream looping
+        music.stream.buffer->loopPointsEnabled = false;
+        music.stream.buffer->loopStartFrame = 0;
+        music.stream.buffer->loopEndFrame = 0;
+    }
+    else if ((music.ctxType != MUSIC_AUDIO_WAV) && (music.ctxType != MUSIC_AUDIO_OGG) &&
+             (music.ctxType != MUSIC_AUDIO_MP3) && (music.ctxType != MUSIC_AUDIO_FLAC))
+    {
+        TRACELOG(LOG_WARNING, "MUSIC: Loop points not supported for this music format");
+    }
+    else
+    {
+        if (loopEnd > music.frameCount)
+        {
+            TRACELOG(LOG_WARNING, "MUSIC: Loop end out of bounds, clamped to stream frame count");
+            loopEnd = music.frameCount;
+        }
+
+        if (loopStart >= loopEnd) TRACELOG(LOG_WARNING, "MUSIC: Invalid loop points (empty or reversed loop), request ignored");
+        else
+        {
+            music.stream.buffer->loopStartFrame = loopStart;
+            music.stream.buffer->loopEndFrame = loopEnd;
+            music.stream.buffer->loopPointsEnabled = true;
+        }
+    }
+
+    ma_mutex_unlock(&AUDIO.System.lock);
+}
+
+// Get music loop points (in frames)
+// Returns true if custom loop points are enabled, false if the full stream is looped
+// NOTE: When no custom loop points are set, returned range is the full stream: [0, frameCount]
+bool GetMusicLoopPoints(Music music, unsigned int *loopStart, unsigned int *loopEnd)
+{
+    bool enabled = false;
+    unsigned int start = 0;
+    unsigned int end = music.frameCount;
+
+    if (music.stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        enabled = music.stream.buffer->loopPointsEnabled;
+        if (enabled)
+        {
+            start = music.stream.buffer->loopStartFrame;
+            end = music.stream.buffer->loopEndFrame;
+        }
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+
+    if (loopStart != NULL) *loopStart = start;
+    if (loopEnd != NULL) *loopEnd = end;
+
+    return enabled;
+}
+
 // Get music time length (in seconds)
 float GetMusicTimeLength(Music music)
 {
@@ -2091,8 +2408,24 @@ float GetMusicTimePlayed(Music music)
         int framesInBuffers = framesInFirstBuffer + framesInSecondBuffer;
         if (((unsigned int)framesInBuffers > music.frameCount) && !music.looping) framesInBuffers = music.frameCount;
         int framesSentToMix = music.stream.buffer->frameCursorPos%subBufferSize;
-        int framesPlayed = (framesProcessed - framesInBuffers + framesSentToMix)%(int)music.frameCount;
-        if (framesPlayed < 0) framesPlayed += music.frameCount;
+        int framesPlayed = 0;
+
+        if (music.stream.buffer->loopPointsEnabled && music.looping)
+        {
+            // With custom loop points, played time is mapped into the loop region
+            long long loopStart = music.stream.buffer->loopStartFrame;
+            long long loopEnd = music.stream.buffer->loopEndFrame;
+            long long loopLength = loopEnd - loopStart;
+            long long framesCursor = (long long)framesProcessed - framesInBuffers + framesSentToMix;
+            if (framesCursor < 0) framesCursor = 0;
+            framesPlayed = (int)((framesCursor >= loopEnd)? (loopStart + (framesCursor - loopStart)%loopLength) : framesCursor);
+        }
+        else
+        {
+            framesPlayed = (framesProcessed - framesInBuffers + framesSentToMix)%(int)music.frameCount;
+            if (framesPlayed < 0) framesPlayed += music.frameCount;
+        }
+
         secondsPlayed = (float)framesPlayed/music.stream.sampleRate;
         ma_mutex_unlock(&AUDIO.System.lock);
     }
@@ -2693,6 +3026,7 @@ static void StopAudioBufferInLockedState(AudioBuffer *buffer)
             buffer->paused = false;
             buffer->frameCursorPos = 0;
             buffer->framesProcessed = 0;
+            buffer->streamPosition = 0;
             buffer->isSubBufferProcessed[0] = true;
             buffer->isSubBufferProcessed[1] = true;
         }

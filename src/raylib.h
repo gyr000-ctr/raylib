@@ -1731,6 +1731,8 @@ RLAPI void SeekMusicStream(Music music, float position);              // Seek mu
 RLAPI void SetMusicVolume(Music music, float volume);                 // Set volume for music (1.0 is max level)
 RLAPI void SetMusicPitch(Music music, float pitch);                   // Set pitch for music (1.0 is base level)
 RLAPI void SetMusicPan(Music music, float pan);                       // Set pan for music (-1.0 left, 0.0 center, 1.0 right)
+RLAPI void SetMusicLoopPoints(Music music, unsigned int loopStart, unsigned int loopEnd); // Set music loop points (in frames), set loopEnd to 0 to clear custom loop points
+RLAPI bool GetMusicLoopPoints(Music music, unsigned int *loopStart, unsigned int *loopEnd); // Get music loop points (in frames), returns true if custom loop points are enabled
 RLAPI float GetMusicTimeLength(Music music);                          // Get music time length (in seconds)
 RLAPI float GetMusicTimePlayed(Music music);                          // Get current music time played (in seconds)
 
